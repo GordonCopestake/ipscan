@@ -250,6 +250,20 @@ impl HostTable {
         self.entry(ip).set_mac(mac);
     }
 
+    /// Record a hardware address only for a host that has none.
+    ///
+    /// Used to fill in gaps from the neighbour cache after probing, where a
+    /// direct ARP reply is stronger evidence than a cache entry and so must not
+    /// be overwritten. Returns whether the host was filled in.
+    pub fn record_mac_if_absent(&mut self, ip: Ipv4Addr, mac: MacAddr) -> bool {
+        let host = self.entry(ip);
+        if host.mac.is_some() {
+            return false;
+        }
+        host.set_mac(mac);
+        true
+    }
+
     pub fn record_hostname(&mut self, ip: Ipv4Addr, name: String) {
         self.entry(ip).hostname = Some(name);
     }
@@ -292,6 +306,31 @@ mod tests {
         );
         assert_eq!(MacAddr::parse("nonsense"), None);
         assert_eq!(MacAddr::parse("f0:09:0d:2a:86"), None);
+    }
+
+    #[test]
+    fn a_recovered_mac_never_overwrites_a_direct_reply() {
+        // A direct arp reply is stronger evidence than a neighbour-cache entry, so
+        // the late recovery pass must leave an address alone once one is known.
+        let ip = "10.0.0.7".parse().unwrap();
+        let direct = MacAddr::parse("f0:09:0d:2a:86:fd").unwrap();
+        let cached = MacAddr::parse("8c:22:d2:bf:2e:05").unwrap();
+
+        let mut t = HostTable::new();
+        let replied = Evidence::new(Method::Icmp, Outcome::Alive);
+        assert!(
+            t.record_mac_if_absent(ip, direct),
+            "the first address is a recovery"
+        );
+        assert!(!t.record_mac_if_absent(ip, cached), "the second is not");
+        t.record(ip, replied.clone());
+        assert_eq!(t.alive()[0].mac, Some(direct));
+
+        // Unrelated hosts are untouched.
+        let other = "10.0.0.8".parse().unwrap();
+        assert!(t.record_mac_if_absent(other, cached));
+        t.record(other, replied);
+        assert_eq!(t.alive()[1].mac, Some(cached));
     }
 
     #[test]

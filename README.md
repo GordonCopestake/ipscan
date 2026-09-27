@@ -295,6 +295,25 @@ the phase is ineffective rather than authoritative, so the answers are kept and
 the failure is reported instead. Otherwise a virtual interface that cannot do ARP
 would turn a working scan into an empty one.
 
+### Asking the cache again, because a sweep loses replies
+
+Sweeping a few hundred addresses at once saturates the reply path, and a real
+machine that loses its ARP reply is then indistinguishable from an address nothing
+owns. So after probing, the neighbour cache is read a second time and any address
+that still has no hardware address is looked up in it.
+
+That is nearly free, and it is not redundant. To send an echo to a host on our own
+link the stack has to resolve it first, so a host that answered at all has a
+hardware address in the cache by the end of the scan — including the ones the
+concurrent sweep dropped. On a real Windows scan this recovered a host that
+`arp -a` had and the sweep had not, which is the difference between a census of 115
+and one of 116.
+
+It only ever adds attribution, never removes it. A direct ARP reply is stronger
+evidence than a cache entry, so a known address is never overwritten, and an
+address nothing owns has no entry to be found in. There is no reason to switch it
+off, so there is no switch.
+
 ### `-p` is a question about ports, not a fallback
 
 The cascade only spends a TCP connect on addresses nothing else answered for,

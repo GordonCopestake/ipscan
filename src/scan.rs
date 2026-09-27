@@ -340,8 +340,6 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         }
     }
 
-    let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
-    hosts.sort_by_key(|h| u32::from(h.ip));
     // Addresses that answered a later phase without ARP naming them are kept out
     // of the default list, but only inside the set where ARP could have named
     // them. `eligible` is that set: on-link, non-loopback, and only when the ARP
@@ -357,6 +355,59 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     } else {
         HashSet::new()
     };
+
+    // ------------------------------------------------ late arp recovery ----
+    // A later phase resolves addresses the ARP phase failed to. Sending an echo
+    // to a host on our own link requires having resolved it first, so by the time
+    // the probes are done the stack holds hardware addresses for every live host
+    // that genuinely exists -- including any the concurrent ARP sweep lost a
+    // reply for.
+    //
+    // That is worth a second look, because losing one is easy: a sweep of a few
+    // hundred addresses saturates the reply path, and a real machine is then
+    // indistinguishable from an address nothing owns. On a real Windows scan the
+    // difference was one host the sweep missed that the OS cache had, and this
+    // is what puts it back. The cost is one table read, which is instant.
+    //
+    // It only ever *adds* attribution. A device that never resolved anything has
+    // no entry, so an address nothing owns stays unattributed -- which is the
+    // whole point of withholding them.
+    if arp_ran && !eligible.is_empty() {
+        match neighbour::read_table() {
+            Ok(entries) => {
+                let mut learned = 0usize;
+                for n in entries {
+                    // An unspecified address is an entry Windows never finished
+                    // resolving, not a device, so it cannot attribute anything.
+                    let usable = eligible.contains(&n.ip) && !n.mac.is_unspecified();
+                    if usable && table.record_mac_if_absent(n.ip, n.mac) {
+                        learned += 1;
+                    }
+                }
+                if learned > 0 {
+                    if plan.progress {
+                        eprintln!(
+                            "  arp: recovered the hardware address of {} host{} from \
+                             the neighbour cache",
+                            learned,
+                            if learned == 1 { "" } else { "s" }
+                        );
+                    }
+                    stats.note(format!(
+                        "recovered {learned} hardware address{} from the neighbour cache \
+                         after probing, which arp had not answered for",
+                        if learned == 1 { "" } else { "es" }
+                    ));
+                }
+            }
+            Err(e) => stats.note(format!(
+                "neighbour cache re-read after probing failed: {e:#}"
+            )),
+        }
+    }
+
+    let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
+    hosts.sort_by_key(|h| u32::from(h.ip));
     let (attributed, unattributed) = split_by_attribution(&hosts, &eligible);
 
     warn_about_unattributable_hosts(plan, &mut stats, &hosts, &eligible);
