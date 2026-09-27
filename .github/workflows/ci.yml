@@ -47,22 +47,41 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --check
 
-      # Temporary: is a loader failure specific to this crate, or does a trivial
-      # binary fail the same way on this runner image?
-      - name: "Baseline - does a hello-world crate load?"
+      - name: "Check imported entry points exist in the DLLs"
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          $d = Join-Path $env:RUNNER_TEMP hello
-          New-Item -ItemType Directory -Force -Path $d | Out-Null
-          Set-Location $d
-          cargo init --name hello --bin | Out-Null
-          cargo test 2>&1 | Select-Object -Last 6
-          "--- now the real binary ---"
-          Set-Location $env:GITHUB_WORKSPACE
-          cargo build --locked --target x86_64-pc-windows-msvc
-          & "target\x86_64-pc-windows-msvc\debug\ipscan.exe" --version
-          "ipscan.exe exit code: $LASTEXITCODE"
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class PE {
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr LoadLibrary(string p);
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr GetProcAddress(IntPtr h, string n);
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr GetProcAddress(IntPtr h, IntPtr ordinal);
+          }
+          "@
+          $want = [ordered]@{
+            'netapi32.dll' = @('NetApiFreeMemory')
+            'ws2_32.dll'   = @('GetAddrInfoExW','FreeAddrInfoExW','getaddrinfo','freeaddrinfo')
+            'iphlpapi.dll' = @('SendARP','GetIpNetTable2','IcmpSendEcho2')
+          }
+          foreach ($dll in $want.Keys) {
+            $full = Join-Path $env:SystemRoot "System32\$dll"
+            if (-not (Test-Path $full)) { "MISSING DLL $dll"; continue }
+            $h = [PE]::LoadLibrary($full)
+            "=== $dll handle=$h ==="
+            foreach ($fn in $want[$dll]) {
+              "  name $fn -> " + [PE]::GetProcAddress($h, $fn)
+            }
+          }
+          # The ws2_32 import descriptor also uses ordinals; check those too.
+          $h2 = [PE]::LoadLibrary((Join-Path $env:SystemRoot 'System32\ws2_32.dll'))
+          foreach ($ord in 273, 165) {
+            "  ws2_32 ordinal $ord -> " + [PE]::GetProcAddress($h2, [IntPtr]$ord)
+          }
 
       # Unit tests need no external network beyond loopback, so they run on
       # every platform to cover the native probe backends too.
