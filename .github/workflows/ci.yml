@@ -47,41 +47,15 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --check
 
-      - name: "Check imported entry points exist in the DLLs"
+      # A binary that links but cannot be loaded is a real failure mode on
+      # Windows, and only running it catches it.
+      - name: "Smoke test the built binary"
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          Add-Type @"
-          using System;
-          using System.Runtime.InteropServices;
-          public static class PE {
-            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
-            public static extern IntPtr LoadLibrary(string p);
-            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
-            public static extern IntPtr GetProcAddress(IntPtr h, string n);
-            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
-            public static extern IntPtr GetProcAddress(IntPtr h, IntPtr ordinal);
-          }
-          "@
-          $want = [ordered]@{
-            'netapi32.dll' = @('NetApiFreeMemory')
-            'ws2_32.dll'   = @('GetAddrInfoExW','FreeAddrInfoExW','getaddrinfo','freeaddrinfo')
-            'iphlpapi.dll' = @('SendARP','GetIpNetTable2','IcmpSendEcho2')
-          }
-          foreach ($dll in $want.Keys) {
-            $full = Join-Path $env:SystemRoot "System32\$dll"
-            if (-not (Test-Path $full)) { "MISSING DLL $dll"; continue }
-            $h = [PE]::LoadLibrary($full)
-            "=== $dll handle=$h ==="
-            foreach ($fn in $want[$dll]) {
-              "  name $fn -> " + [PE]::GetProcAddress($h, $fn)
-            }
-          }
-          # The ws2_32 import descriptor also uses ordinals; check those too.
-          $h2 = [PE]::LoadLibrary((Join-Path $env:SystemRoot 'System32\ws2_32.dll'))
-          foreach ($ord in 273, 165) {
-            "  ws2_32 ordinal $ord -> " + [PE]::GetProcAddress($h2, [IntPtr]$ord)
-          }
+          cargo build --locked --target x86_64-pc-windows-msvc
+          & "target\x86_64-pc-windows-msvc\debug\ipscan.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Unit tests need no external network beyond loopback, so they run on
       # every platform to cover the native probe backends too.

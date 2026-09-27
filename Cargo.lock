@@ -199,7 +199,6 @@ dependencies = [
  "socket2",
  "thiserror",
  "windows",
- "windows-link",
 ]
 
 [[package]]

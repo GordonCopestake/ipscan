@@ -194,71 +194,67 @@ mod platform {
 
     use anyhow::Result;
     use windows::Win32::NetworkManagement::IpHelper::{
-        GetIpNetTable2, MIB_IPNET_ROW2, MIB_IPNET_TABLE2,
+        GetIpNetTable, MIB_IPNETROW_LH, MIB_IPNETTABLE,
     };
-    use windows::Win32::Networking::WinSock::AF_INET;
 
-    /// `GetIpNetTable2` allocates the table for us and reports ERROR_BUFFER_OVERFLOW
-    /// the first time, so it is called twice: once to learn there is a table at
-    /// all, and once more to actually fill it.
+    /// `GetIpNetTable` fills a buffer the caller supplies, so it is called twice:
+    /// once with a null pointer to learn how much space the table needs, and once
+    /// more with an allocation of at least that size.
+    ///
+    /// The v1 table is used rather than `GetIpNetTable2` because v2 hands back an
+    /// allocation that must be released with `NetApiFreeMemory`, and that symbol
+    /// is not exported by `netapi32.dll` on current Windows. Importing it makes
+    /// the whole binary fail to load with STATUS_ENTRYPOINT_NOT_FOUND.
     pub fn read() -> Result<Vec<super::Neighbour>> {
-        let mut raw: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
-        let rc = unsafe { GetIpNetTable2(AF_INET, &mut raw) };
+        const NO_ERROR: u32 = 0;
+        const ERROR_BUFFER_OVERFLOW: u32 = 111;
 
-        // ERROR_NO_DATA (232) means the neighbour table is simply empty, which is
-        // a normal state on a fresh machine and not an error.
-        if rc.0 != 0 || raw.is_null() {
+        let mut size: u32 = 0;
+        let rc = unsafe { GetIpNetTable(None, &mut size, false) };
+
+        // An empty table is a normal state on a fresh machine, not a failure. So
+        // is being told how much room to reserve, which is the expected answer.
+        if size == 0 || (rc != ERROR_BUFFER_OVERFLOW && rc != NO_ERROR) {
             return Ok(Vec::new());
         }
 
-        // The table is owned by the OS once it has been handed back, so it has
-        // to be released no matter how the rows are read.
-        let guard = TableGuard(raw);
-        let table = unsafe { &*guard.0 };
+        // The API is free to want more space on the second call than it reported
+        // on the first, so keep some headroom rather than risk another overflow.
+        let mut buf = vec![0u8; size as usize + 4096];
+        let mut size = buf.len() as u32;
+        let rc = unsafe {
+            GetIpNetTable(
+                Some(buf.as_mut_ptr().cast::<MIB_IPNETTABLE>()),
+                &mut size,
+                false,
+            )
+        };
+        if rc != NO_ERROR {
+            return Ok(Vec::new());
+        }
 
-        let num = table.NumEntries as usize;
+        // Read the header, then the rows that follow. `table` is a one-element
+        // array that really holds `dwNumEntries` rows.
+        let table = unsafe { &*buf.as_ptr().cast::<MIB_IPNETTABLE>() };
+        let num = table.dwNumEntries as usize;
         if num == 0 {
             return Ok(Vec::new());
         }
-        // `Table` is a one-element array that really holds `NumEntries` rows.
-        let rows = unsafe { std::slice::from_raw_parts(table.Table.as_ptr(), num) };
-
+        let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), num) };
         Ok(rows.iter().filter_map(row_to_neighbour).collect())
     }
 
-    /// Frees the table with `NetApiFreeMemory` on drop.
-    struct TableGuard(*mut MIB_IPNET_TABLE2);
-
-    impl Drop for TableGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { NetApiFreeMemory(self.0.cast()) };
-            }
-        }
-    }
-
-    // `NetApiFreeMemory` is not in the `windows` bindings, so it is declared
-    // here. It lives in `netapi32.dll` and is the documented counterpart to the
-    // allocation `GetIpNetTable2` performs. `link!` imports directly from the
-    // DLL with `+verbatim`/`undecorated`, which a plain `#[link(name = ...)]`
-    // extern block does not manage for this symbol.
-    windows_link::link!("netapi32.dll" "system" fn NetApiFreeMemory(buffer: *mut std::ffi::c_void));
-
-    fn row_to_neighbour(row: &MIB_IPNET_ROW2) -> Option<super::Neighbour> {
+    fn row_to_neighbour(row: &MIB_IPNETROW_LH) -> Option<super::Neighbour> {
         // Only rows the stack has actually resolved are worth reporting, and
         // only Ethernet-sized hardware addresses can be a MAC.
-        let len = row.PhysicalAddressLength as usize;
+        let len = row.dwPhysAddrLen as usize;
         if len == 0 || len > 6 {
             return None;
         }
-        if unsafe { row.Address.si_family } != AF_INET {
-            return None;
-        }
-        let sin = unsafe { row.Address.Ipv4 };
-        let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
+        let ip = Ipv4Addr::from(row.dwAddr.to_ne_bytes());
 
         let mut bytes = [0u8; 6];
-        bytes[..len].copy_from_slice(&row.PhysicalAddress[..len]);
+        bytes[..len].copy_from_slice(&row.bPhysAddr[..len]);
         let mac = crate::host::MacAddr::from_bytes(bytes);
         if mac.is_broadcast() {
             return None;
@@ -266,6 +262,7 @@ mod platform {
 
         Some(super::Neighbour {
             ip,
+
             mac,
             iface: None,
         })
