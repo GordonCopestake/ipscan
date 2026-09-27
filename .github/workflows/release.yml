@@ -1,0 +1,112 @@
+name: Release
+
+# Building a Windows binary needs a Windows linker, so the archives are produced
+# on native runners rather than cross-compiled. Pushing a `v*` tag builds them and
+# publishes a release; a manual run does the same from the current ref.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Debug builds are slow and, for a tool that opens thousands of sockets,
+      # they are also a meaningful performance regression. The release profile in
+      # Cargo.toml already sets opt-level, LTO and strip.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Test
+        # The Windows tests bind loopback listeners, so they are worth running
+        # here rather than only on Linux.
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Collect the binary
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="target/${{ matrix.target }}/release/ipscan${{ runner.os == 'Windows' && '.exe' || '' }}"
+          test -f "$src"
+          cp "$src" "dist/ipscan${{ runner.os == 'Windows' && '.exe' || '' }}"
+
+          # Ship the licence text alongside the binary; it is dual licensed and
+          # the terms are part of what is being distributed.
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/ 2>/dev/null || true
+
+          stem="ipscan-${{ github.ref_name }}-${{ matrix.target }}"
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            # Files sit at the archive root, not nested under `dist/`, so
+            # unpacking does not add a pointless directory level.
+            tar -czf "$stem.tar.gz" -C dist .
+          else
+            (cd dist && zip -r "../$stem.zip" .)
+          fi
+          echo "archive=$stem.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum "${{ steps.collect.outputs.archive }}"* > "${{ steps.collect.outputs.archive }}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipscan-${{ matrix.target }}
+          path: |
+            dist/${{ steps.collect.outputs.archive }}
+            dist/${{ steps.collect.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Gather the archives
+        run: |
+          set -euo pipefail
+          mkdir -p publish
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
+            -exec cp {} publish/ \;
+          ls -l publish/
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            publish/*.tar.gz
+            publish/*.zip
+            publish/*.sha256

@@ -1,0 +1,185 @@
+# ipscan
+
+Find out who is on your network, quickly, without asking for root.
+
+`ipscan` sweeps a range of IPv4 addresses and tells you which ones are actually
+in use, then tries to tell you *what* they are. On a `/24` it takes about three
+seconds, and it needs no privileges on Linux.
+
+```
+$ ipscan
+IP             MAC                PORT      RTT  TTL  METHOD
+192.168.0.1    f0:09:0d:2a:86:fd     80    2.12 ms  64   icmp
+192.168.0.11   5c:49:7d:f1:14:0d    445    1.96 ms  64   icmp
+192.168.0.79  -                      -    0.81 ms  64   icmp
+192.168.0.90  1a:28:61:34:77:4a   8080   92.04 ms  64   icmp
+
+3 hosts found out of 256 addresses scanned in 2.98s via wlp0s20f3
+```
+
+## A timeout does not mean a machine is dead
+
+This is the part that separates a scanner from a coin flip. Three outcomes are
+reported, not two:
+
+| Outcome | Meaning | Evidence |
+|---|---|---|
+| `alive` | It answered an echo, or accepted a connection. | Unambiguous. |
+| `filtered` | It sent back a reset, or an ICMP unreachable. | Unambiguous: something is there and refusing us. |
+| `silent` | Nothing came back. | **No evidence either way.** |
+
+`silent` is never counted as a dead host. A firewall, a sleeping laptop, and an
+empty IP address all look identical from outside, and pretending otherwise is
+how you end up power-cycling a machine that was fine.
+
+## How it probes
+
+Cheapest and most conclusive method first, and each stage only runs against the
+addresses the previous one could not settle:
+
+1. **ARP** — settles the whole local subnet in one shot. Needs `CAP_NET_RAW`, so
+   it is skipped with a note rather than a failure when unprivileged.
+2. **ICMP echo** — one unprivileged datagram socket, one `sendto` per target,
+   all replies read from a single socket.
+3. **TCP connect** — only for addresses nothing has answered for yet. A
+   connection that is accepted is `alive`; one that is reset is `filtered`,
+   because a refused connection still proves the host exists.
+
+Hardware addresses come from the kernel's neighbour table, read both before the
+sweep (to prioritise addresses that answered recently) and after it (to attach
+MACs to hosts the scan itself resolved).
+
+## Install
+
+### Prebuilt binaries
+
+Grab a release archive for your platform from
+[the releases page](https://github.com/GordonCopestake/ipscan/releases),
+unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
+
+| Platform | File |
+|---|---|
+| Linux x86-64 | `ipscan-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.1.0-x86_64-pc-windows-msvc.zip` |
+
+Each archive ships a `.sha256` file next to it. On Linux, verify before running:
+
+```
+sha256sum -c ipscan-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+macOS and arm64 Linux builds are not published as binaries; build from source
+there, or use a package manager.
+
+### Building from source
+
+You need the [Rust toolchain](https://rustup.rs); edition 2024 means **1.85 or
+newer**. On Debian/Ubuntu that is `apt install build-essential`, plus `pkg-config`
+if you would rather let the linker find system libraries. No other dependencies:
+everything else comes from crates.io.
+
+```
+git clone https://github.com/GordonCopestake/ipscan.git
+cd ipscan
+
+# a debug build for hacking on
+cargo build
+
+# an optimised build, which is what you want to run
+cargo build --release
+
+# the binary lands at target/release/ipscan
+./target/release/ipscan --help
+```
+
+Or install it onto your system, which puts `ipscan` in `~/.cargo/bin`:
+
+```
+cargo install --path .
+```
+
+To check the build before trusting it:
+
+```
+cargo test          # 81 unit tests
+cargo clippy --all-targets
+```
+
+Cross-compiling to another platform needs that platform's target and linker,
+so it is usually easier to let the release workflow do it. To type-check a
+target without producing a runnable binary:
+
+```
+rustup target add x86_64-pc-windows-msvc
+cargo check --target x86_64-pc-windows-msvc
+```
+
+## Usage
+
+Scan your own subnet:
+
+```
+ipscan
+```
+
+Scan anything:
+
+```
+ipscan 192.168.1.0/24          # a network
+ipscan 10.0.0.5                # one address
+ipscan 10.0.0.1-254            # a range
+ipscan 10.0.0.1,10.0.0.9       # a list
+ipscan 10.0.0.0/24 172.16.0.0/16
+```
+
+Pick the interface, the ports, or the method:
+
+```
+ipscan -i eth0                  # force the interface and its subnet
+ipscan -p 22,80,443             # TCP ports for the last resort
+ipscan -m icmp                  # skip ARP and TCP entirely
+ipscan --timeout 500 --retries 0
+```
+
+Choose an output format, and where it goes:
+
+```
+ipscan -f table                 # aligned columns (default)
+ipscan -f wide                  # adds hostname
+ipscan -f json -o report.json
+ipscan -f jsonl | jq .ip        # one object per line
+ipscan -f csv -o hosts.csv
+ipscan -f bare | while read ip; do ...; done
+ipscan -f md                    # a markdown table
+```
+
+Other useful flags:
+
+```
+ipscan -L                       # list interfaces and their subnets
+ipscan --dns                    # reverse-resolve (slower)
+ipscan --cached                 # also show addresses only the OS cache knows
+ipscan --sort rtt               # order by latency, ip, or hostname
+ipscan -q                       # no summary line
+ipscan -v                       # per-stage progress and notes
+```
+
+`ipscan --help` has the full list.
+
+## Privileges
+
+On Linux, active ARP needs `CAP_NET_RAW` and everything else does not. Without it
+you still get a full scan from ICMP and TCP, plus MACs for any address the
+kernel happens to have resolved; `ipscan -v` says so explicitly rather than
+failing.
+
+## Platforms
+
+Linux, macOS, and Windows are supported. ICMP uses an unprivileged datagram
+socket on Unix and `IcmpSendEcho2` on Windows, ARP uses `AF_PACKET` on Linux and
+`SendARP` on Windows, and the neighbour table is read from `/proc/net/arp`,
+`arp -n`, or `GetIpNetTable2` respectively.
+
+## Licence
+
+MIT or Apache-2.0, at your option.

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      # The macOS and Windows backends are behind `cfg`, so nothing but a
+      # cross-target check proves they still compile. This is the only automated
+      # signal that the Win32 FFI has not rotted.
+      - name: Check
+        run: cargo check --locked --target ${{ matrix.target }} --all-targets
+
+      - name: Clippy
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Format
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --check
+
+      # Unit tests need no external network beyond loopback, so they run on
+      # every platform to cover the native probe backends too.
+      - name: Test
+        run: cargo test --locked
+
+  package:
+    name: Package sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Confirms `cargo package` can build the crate as published, which catches
+      # a missing file reference in Cargo.toml (such as `readme`) before a tag.
+      - run: cargo package --locked
