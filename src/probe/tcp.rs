@@ -376,7 +376,10 @@ mod tests {
     /// So pick a low port, only consider one we can actually take, and keep it
     /// only once a refusal has been observed.
     fn confirmed_refusing_port() -> Option<u16> {
-        for port in (1024..40_000).step_by(7) {
+        // Only a bounded number of candidates are tried: each miss costs a
+        // connect timeout, and on a host that never resets anything an unbounded
+        // scan of the port range would take minutes to fail.
+        for port in (1024..40_000).step_by(997).take(40) {
             let Ok(addr) = format!("127.0.0.1:{port}").parse::<SocketAddr>() else {
                 continue;
             };
