@@ -314,34 +314,82 @@ mod tests {
         })
     }
 
-    /// An ephemeral port with nothing behind it, to produce a refusal.
-    fn dead_port() -> u16 {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
+    /// `ECONNREFUSED` / `WSAECONNREFUSED`, the other shape a reset can take.
+    #[cfg(unix)]
+    const REFUSED: i32 = libc::ECONNREFUSED;
+    #[cfg(windows)]
+    const REFUSED: i32 = 10061;
+
+    /// `ETIMEDOUT` / `WSAETIMEDOUT`, which says nothing about the host at all.
+    #[cfg(unix)]
+    const TIMED_OUT: i32 = libc::ETIMEDOUT;
+    #[cfg(windows)]
+    const TIMED_OUT: i32 = 10060;
+
+    /// `EHOSTUNREACH` / `WSAEHOSTUNREACH`, which says nothing either.
+    #[cfg(unix)]
+    const HOST_UNREACH: i32 = libc::EHOSTUNREACH;
+    #[cfg(windows)]
+    const HOST_UNREACH: i32 = 10065;
+
+    /// The reset classification, tested directly so it is covered everywhere.
+    ///
+    /// This is the rule that matters most in the whole tool, and it has to hold
+    /// on a host that cannot be persuaded to actually reset anything, so it is
+    /// checked against the error codes themselves rather than against the
+    /// network.
+    #[test]
+    fn a_reset_is_classified_as_a_refusal_and_a_clean_socket_is_not() {
+        // Both shapes a refusal can take: a successful call carrying the pending
+        // SO_ERROR, and an error from the call itself.
+        assert!(
+            refused(&Ok(Some(io::Error::from_raw_os_error(REFUSED)))),
+            "a refusal is proof of life"
+        );
+        assert!(
+            refused(&Err(io::Error::from_raw_os_error(RESET))),
+            "a reset is proof of life"
+        );
+
+        // A completed handshake has no pending error, and must not be mistaken
+        // for a refusal.
+        assert!(!refused(&Ok(None)), "a completed connect is not a refusal");
+        assert!(
+            !refused(&Ok(Some(io::Error::from_raw_os_error(TIMED_OUT)))),
+            "a timeout says nothing and is not a refusal"
+        );
+        assert!(
+            !refused(&Err(io::Error::from_raw_os_error(HOST_UNREACH))),
+            "an unreachable host is not a refusal"
+        );
     }
 
-    /// A port confirmed to be refusing connections.
+    /// A port, below the dynamic range, that is confirmed to refuse connections.
     ///
-    /// [`dead_port`] on its own is not good enough: the port is released the
-    /// moment the listener drops, and a test running in parallel can claim it
-    /// before the prober dials it, which turns the expected refusal into an
-    /// accept. So dial it first and only keep the port if a refusal actually
-    /// comes back.
-    fn confirmed_dead_port() -> u16 {
-        for _ in 0..64 {
-            let port = dead_port();
+    /// Two things make this harder than binding an ephemeral port and letting it
+    /// go. A port released that way can be claimed by another test before the
+    /// prober dials it, turning the expected refusal into an accept. And Windows
+    /// protects the ephemeral range, so a connect to a port it has just handed
+    /// out is met with silence rather than a reset, which is indistinguishable
+    /// from a filtered host.
+    ///
+    /// So pick a low port, only consider one we can actually take, and keep it
+    /// only once a refusal has been observed.
+    fn confirmed_refusing_port() -> Option<u16> {
+        for port in (1024..40_000).step_by(7) {
             let Ok(addr) = format!("127.0.0.1:{port}").parse::<SocketAddr>() else {
                 continue;
             };
-            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
-                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return port,
-                // Something claimed the port, so it was not a dead port after all.
+            // Only a port we can take is a port we know nothing is listening on.
+            if std::net::TcpListener::bind(addr).is_err() {
+                continue;
+            }
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return Some(port),
                 _ => continue,
             }
         }
-        panic!("could not find a port that refuses connections");
+        None
     }
 
     #[test]
@@ -367,7 +415,10 @@ mod tests {
     #[test]
     fn a_reset_is_reported_as_filtered_not_silent() {
         // This is the case that matters most: a host that is up but refuses us.
-        let port = confirmed_dead_port();
+        let Some(port) = confirmed_refusing_port() else {
+            eprintln!("skipping: no port on this host answers with a reset");
+            return;
+        };
         let mut p = prober_on(&[port]);
         let replies = p.probe_round(&[Ipv4Addr::LOCALHOST]).unwrap();
 
@@ -406,7 +457,11 @@ mod tests {
             let _ = listener.accept();
         });
 
-        let mut p = prober_on(&[open, confirmed_dead_port(), confirmed_dead_port()]);
+        let Some(closed) = confirmed_refusing_port() else {
+            eprintln!("skipping: no port on this host answers with a reset");
+            return;
+        };
+        let mut p = prober_on(&[open, closed, closed]);
         let replies = p.probe_round(&[Ipv4Addr::LOCALHOST]).unwrap();
         assert_eq!(replies.len(), 1, "targets must not be reported twice");
     }
@@ -430,7 +485,11 @@ mod tests {
         });
 
         let targets: Vec<Ipv4Addr> = (1..=64).map(|i| Ipv4Addr::new(127, 0, 0, i)).collect();
-        let mut p = prober_on(&[port, confirmed_dead_port()]);
+        let Some(closed) = confirmed_refusing_port() else {
+            eprintln!("skipping: no port on this host answers with a reset");
+            return;
+        };
+        let mut p = prober_on(&[port, closed]);
         let replies = p.probe_round(&targets).unwrap();
 
         assert_eq!(
@@ -461,8 +520,10 @@ mod tests {
     #[test]
     fn refill_does_not_invent_evidence_for_unreachable_targets() {
         let targets: Vec<Ipv4Addr> = (1..=64).map(|i| Ipv4Addr::new(192, 0, 2, i)).collect();
+        // The targets are unroutable, so nothing local has to be listening and
+        // no port needs to be negotiated: the connect never leaves the host.
         let mut p = TcpProber::new(&ProbeConfig {
-            ports: vec![confirmed_dead_port()],
+            ports: vec![9],
             // Kept short so a whole batch of timeouts does not dominate the run.
             timeout: Duration::from_millis(400),
             concurrency: 8,
