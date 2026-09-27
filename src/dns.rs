@@ -134,19 +134,17 @@ mod imp {
 
         // The block chain is only released once the name has been copied out.
         unsafe {
-            free_addr_info(result);
+            FreeAddrInfo(result);
         }
         found
     }
 
     // `FreeAddrInfo` is not in the `windows` bindings, which only carry the `Ex`
-    // variants, so it is declared here. `ws2_32.dll` is the same library every
-    // other Winsock call here comes from.
-    #[link(name = "ws2_32")]
-    unsafe extern "system" {
-        #[link_name = "FreeAddrInfo"]
-        fn free_addr_info(addr_info: *mut ADDRINFOW) -> i32;
-    }
+    // variants, so it is declared here. `link!` is the same mechanism the
+    // `windows` crate uses internally: it imports straight from the DLL with
+    // `+verbatim`/`undecorated`, which a plain `#[link(name = ...)]` extern
+    // block cannot do for these symbols.
+    windows_link::link!("ws2_32.dll" "system" fn FreeAddrInfo(addr_info: *mut ADDRINFOW) -> i32);
 
     /// Starts Winsock for the lifetime of the guard and undoes it on drop.
     struct WinsockGuard;

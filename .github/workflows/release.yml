@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist out
           src="target/${{ matrix.target }}/release/ipscan${{ runner.os == 'Windows' && '.exe' || '' }}"
           test -f "$src"
           cp "$src" "dist/ipscan${{ runner.os == 'Windows' && '.exe' || '' }}"
@@ -60,13 +60,15 @@ jobs:
           # the terms are part of what is being distributed.
           cp README.md LICENSE-MIT LICENSE-APACHE dist/ 2>/dev/null || true
 
+          # The archive goes in `out/`, not `dist/`, so that packing `dist/` can
+          # never pick up the archive itself.
           stem="ipscan-${{ github.ref_name }}-${{ matrix.target }}"
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
             # Files sit at the archive root, not nested under `dist/`, so
             # unpacking does not add a pointless directory level.
-            tar -czf "$stem.tar.gz" -C dist .
+            tar -czf "out/$stem.tar.gz" -C dist .
           else
-            (cd dist && zip -r "../$stem.zip" .)
+            (cd dist && zip -r "../out/$stem.zip" .)
           fi
           echo "archive=$stem.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
 
@@ -74,14 +76,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd dist && sha256sum "${{ steps.collect.outputs.archive }}"* > "${{ steps.collect.outputs.archive }}.sha256")
+          a="${{ steps.collect.outputs.archive }}"
+          sha256sum "out/$a" > "out/$a.sha256"
+          cat "out/$a.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ipscan-${{ matrix.target }}
           path: |
-            dist/${{ steps.collect.outputs.archive }}
-            dist/${{ steps.collect.outputs.archive }}.sha256
+            out/${{ steps.collect.outputs.archive }}
+            out/${{ steps.collect.outputs.archive }}.sha256
           if-no-files-found: error
 
   release:

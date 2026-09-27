@@ -232,19 +232,17 @@ mod platform {
     impl Drop for TableGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                unsafe { net_api_free_memory(self.0.cast()) };
+                unsafe { NetApiFreeMemory(self.0.cast()) };
             }
         }
     }
 
     // `NetApiFreeMemory` is not in the `windows` bindings, so it is declared
     // here. It lives in `netapi32.dll` and is the documented counterpart to the
-    // allocation `GetIpNetTable2` performs.
-    #[link(name = "netapi32")]
-    unsafe extern "system" {
-        #[link_name = "NetApiFreeMemory"]
-        fn net_api_free_memory(buffer: *mut std::ffi::c_void);
-    }
+    // allocation `GetIpNetTable2` performs. `link!` imports directly from the
+    // DLL with `+verbatim`/`undecorated`, which a plain `#[link(name = ...)]`
+    // extern block does not manage for this symbol.
+    windows_link::link!("netapi32.dll" "system" fn NetApiFreeMemory(buffer: *mut std::ffi::c_void));
 
     fn row_to_neighbour(row: &MIB_IPNET_ROW2) -> Option<super::Neighbour> {
         // Only rows the stack has actually resolved are worth reporting, and
