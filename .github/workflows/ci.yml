@@ -47,6 +47,16 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --check
 
+      # Temporary: dump the raw-dylib import table so a failing loader can be
+      # traced to the specific missing entry point.
+      - name: Dump Windows imports
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: cmd
+        run: |
+          cargo build --locked --target %target% >nul 2>&1 || cargo build --locked --target x86_64-pc-windows-msvc
+          dumpbin /imports target\x86_64-pc-windows-msvc\debug\ipscan.exe > imports.txt 2>&1
+          type imports.txt
+
       # Unit tests need no external network beyond loopback, so they run on
       # every platform to cover the native probe backends too.
       - name: Test
