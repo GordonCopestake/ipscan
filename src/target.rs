@@ -224,6 +224,19 @@ fn parse_cidr(spec: &str) -> Result<(u32, u32), TargetError> {
     };
     let lo = u32::from(addr) & mask;
     let hi = lo | !mask;
+
+    // A CIDR names a network block, and on any block wider than a point-to-point
+    // link the first and last addresses are the network and broadcast
+    // addresses rather than hosts. Probing them is not merely useless, it is
+    // actively misleading: the broadcast address draws a reply from everything
+    // on the segment and the network address from the gateway, and the cascade
+    // would then report both as live machines. This is also what makes the count
+    // match `Interface::usable_hosts`, which excludes them too.
+    //
+    // /31 is exempt: RFC 3021 gives it two usable endpoints. /32 is a host.
+    if prefix <= 30 {
+        return Ok((lo + 1, hi - 1));
+    }
     Ok((lo, hi))
 }
 
@@ -308,20 +321,28 @@ mod tests {
     }
 
     #[test]
-    fn cidr_24() {
+    fn cidr_24_excludes_the_network_and_broadcast_addresses() {
         let s = set("192.168.1.0/24");
-        assert_eq!(s.len(), 256);
+        assert_eq!(s.len(), 254);
         let v = all("192.168.1.0/24");
-        assert_eq!(v.first(), Some(&Ipv4Addr::new(192, 168, 1, 0)));
-        assert_eq!(v.last(), Some(&Ipv4Addr::new(192, 168, 1, 255)));
+        assert_eq!(v.first(), Some(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(v.last(), Some(&Ipv4Addr::new(192, 168, 1, 254)));
+        assert!(
+            !s.contains(Ipv4Addr::new(192, 168, 1, 0)),
+            "the network address is not a host"
+        );
+        assert!(
+            !s.contains(Ipv4Addr::new(192, 168, 1, 255)),
+            "the broadcast address is not a host"
+        );
     }
 
     #[test]
     fn cidr_with_host_bits_set_is_masked_not_rejected() {
         // 192.168.1.77/24 means the whole 192.168.1.0/24 block.
         let v = all("192.168.1.77/24");
-        assert_eq!(v.len(), 256);
-        assert_eq!(v.first(), Some(&Ipv4Addr::new(192, 168, 1, 0)));
+        assert_eq!(v.len(), 254);
+        assert_eq!(v.first(), Some(&Ipv4Addr::new(192, 168, 1, 1)));
     }
 
     #[test]
@@ -332,7 +353,7 @@ mod tests {
 
     #[test]
     fn cidr_slash_zero_is_the_whole_space() {
-        assert_eq!(set("0.0.0.0/0").len(), 1u64 << 32);
+        assert_eq!(set("0.0.0.0/0").len(), (1u64 << 32) - 2);
     }
 
     #[test]
@@ -382,7 +403,7 @@ mod tests {
     #[test]
     fn overlapping_targets_are_probed_once() {
         let s = TargetSet::parse(["10.0.0.0/24", "10.0.0.10-10.0.0.20", "10.0.0.5"]).unwrap();
-        assert_eq!(s.len(), 256, "overlap must not inflate the count");
+        assert_eq!(s.len(), 254, "overlap must not inflate the count");
         let v: Vec<_> = s.iter().collect();
         let mut sorted = v.clone();
         sorted.sort_unstable();
@@ -414,9 +435,12 @@ mod tests {
 
     #[test]
     fn contains_respects_membership() {
+        // A /28 is 192.168.1.0-15, of which .0 and .15 are network/broadcast.
         let s = set("192.168.1.0/28");
-        assert!(s.contains(Ipv4Addr::new(192, 168, 1, 0)));
-        assert!(s.contains(Ipv4Addr::new(192, 168, 1, 15)));
+        assert!(!s.contains(Ipv4Addr::new(192, 168, 1, 0)));
+        assert!(s.contains(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(s.contains(Ipv4Addr::new(192, 168, 1, 14)));
+        assert!(!s.contains(Ipv4Addr::new(192, 168, 1, 15)));
         assert!(!s.contains(Ipv4Addr::new(192, 168, 1, 16)));
     }
 
@@ -433,7 +457,7 @@ mod tests {
     #[test]
     fn from_network_builds_the_subnet() {
         let s = TargetSet::from_network(Ipv4Addr::new(192, 168, 0, 79), 24).unwrap();
-        assert_eq!(s.len(), 256);
+        assert_eq!(s.len(), 254);
         assert!(s.contains(Ipv4Addr::new(192, 168, 0, 1)));
     }
 

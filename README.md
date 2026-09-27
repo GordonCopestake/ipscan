@@ -163,6 +163,17 @@ ipscan 10.0.0.1,10.0.0.9       # a list
 ipscan 10.0.0.0/24 172.16.0.0/16
 ```
 
+A CIDR names a network block, and on any block wider than a point-to-point link
+the first and last addresses are the network and broadcast addresses rather than
+hosts. Those are skipped, as every mainstream scanner does: `ipscan
+192.168.1.0/24` probes 254 addresses. It matters because the broadcast address
+draws a reply from everything on the segment and the network address from the
+gateway, and reporting either as a live machine is simply wrong. `/31` and `/32`
+are exempt — `/31` has two usable endpoints under RFC 3021, and `/32` is a host.
+
+Ranges, wildcards and bare addresses are taken literally: `ipscan
+192.168.1.1-255` really does include `.255`, because you asked for it by name.
+
 Pick the interface, the ports, or the method:
 
 ```
@@ -218,6 +229,29 @@ loop, and reports elapsed time while they run, so a Windows scan of a sparse
 subnet takes seconds instead of minutes. The cap is deliberate: thread-per-
 request means a thread and a stack per in-flight target, so a large
 `--concurrency` is clamped on these paths rather than taken literally.
+
+### Proxy-ARP will lie to you
+
+One hardware address answering for most of a subnet is not a crowd of machines;
+it is one device answering for a range it merely routes. A router with
+proxy-ARP enabled, a hypervisor switch, or a NAC appliance all reply to ARP on
+behalf of addresses they do not host. Each reply is a real, successful exchange,
+so a sweep that reads "the exchange succeeded" as "a host is there" reports the
+whole routed range as a room full of machines.
+
+Real hosts have distinct MACs, so `ipscan` keeps the hardware address that
+`SendARP` returns and says so when one address accounts for a majority of the
+replies:
+
+```
+probing 254 on-link addresses with arp...
+  warning: 119 of 119 arp replies came from the single hardware address
+  aa:bb:cc:dd:ee:ff, which is proxy-arp: one device answering for a range it
+  routes rather than 119 separate hosts
+```
+
+Treat such addresses as *routed*, not *present*. If you need a trustworthy host
+count on a proxied segment, ARP cannot give you one.
 
 ## Licence
 

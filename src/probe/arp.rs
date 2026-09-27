@@ -458,15 +458,15 @@ mod platform {
             let chunk = targets.len().div_ceil(workers);
             let source = self.source;
 
-            let answered: Vec<Ipv4Addr> = std::thread::scope(|scope| {
+            let answered: Vec<Reply> = std::thread::scope(|scope| {
                 let handles: Vec<_> = targets
                     .chunks(chunk)
                     .map(|batch| {
                         scope.spawn(move || {
                             let mut out = Vec::new();
                             for &ip in batch {
-                                if send_one(source, ip) {
-                                    out.push(ip);
+                                if let Some(mac) = send_one(source, ip) {
+                                    out.push(Reply::new(ip, Outcome::Alive).with_mac(mac));
                                 }
                             }
                             out
@@ -479,24 +479,35 @@ mod platform {
                     .collect()
             });
 
-            Ok(answered
-                .into_iter()
-                .map(|ip| Reply::new(ip, Outcome::Alive))
-                .collect())
+            Ok(answered)
         }
     }
 
     /// `SendARP` takes both addresses as `u32` in network byte order and writes
     /// the hardware address into a caller-supplied buffer, returning the number
     /// of bytes written. Zero means the host did not answer.
-    fn send_one(source: Option<Ipv4Addr>, ip: Ipv4Addr) -> bool {
+    ///
+    /// The address that comes back *is* the reason to be here: an ARP sweep
+    /// that only reported a boolean threw away the one thing this probe can
+    /// learn that ICMP and TCP cannot, leaving the MAC column empty on the
+    /// platform where it should be full.
+    fn send_one(source: Option<Ipv4Addr>, ip: Ipv4Addr) -> Option<crate::host::MacAddr> {
         let dest = u32::from_ne_bytes(ip.octets());
         let src = u32::from_ne_bytes(source.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
 
         let mut mac = [0u8; 6];
         let mut len = mac.len() as u32;
         let rc = unsafe { SendARP(dest, src, mac.as_mut_ptr().cast(), &mut len as *mut u32) };
-        rc == 0 && len == 6 && !crate::host::MacAddr::from_bytes(mac).is_broadcast()
+        if rc != 0 || len as usize != mac.len() {
+            return None;
+        }
+
+        let mac = crate::host::MacAddr::from_bytes(mac);
+        // Broadcast and all-zero are addresses, not hosts.
+        if mac.is_broadcast() || mac.0 == [0; 6] {
+            return None;
+        }
+        Some(mac)
     }
 }
 

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::host::{Host, HostTable, Method, Outcome};
+use crate::host::{Host, HostTable, MacAddr, Method, Outcome};
 use crate::net::Interface;
 use crate::probe::arp::ArpProber;
 use crate::probe::icmp::IcmpProber;
@@ -135,9 +135,19 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         eprintln!("reading the neighbour cache...");
     }
     let cache_started = Instant::now();
-    let cached: Vec<crate::probe::neighbour::Neighbour> =
-        neighbour::read_table().unwrap_or_default();
-    if plan.progress {
+    // The reason is kept rather than discarded. "No entries" and "the read
+    // failed" look identical from the outside, and on Windows that is the
+    // difference between an empty network and a probe that is silently broken.
+    let (cached, cache_error) = match neighbour::read_table() {
+        Ok(table) => (table, None),
+        Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+    };
+    if let Some(reason) = &cache_error {
+        if plan.progress {
+            eprintln!("  neighbour cache: unreadable: {reason}");
+        }
+        stats.note(format!("neighbour cache unreadable: {reason}"));
+    } else if plan.progress {
         eprintln!(
             "  neighbour cache: {} entries in {}",
             cached.len(),
@@ -317,6 +327,50 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     })
 }
 
+/// Warn when a single hardware account answers for most of the subnet.
+///
+/// This is the shape of **proxy-ARP**: a router, a hypervisor switch, or a NAC
+/// appliance replies to ARP on behalf of an address range it merely routes. Each
+/// of those is a genuine, successful ARP exchange, so a sweep that reads
+/// "the exchange succeeded" as "a host is there" cheerfully reports an entire
+/// routed range as a room full of machines.
+///
+/// The tell is the hardware address. Real hosts have distinct MACs; a proxying
+/// device answers with its own, over and over. Keeping the MAC — the thing
+/// `SendARP` hands back, and which this probe used to throw away — is what
+/// turns an undetectable false positive into a sentence the user can act on.
+///
+/// The threshold is deliberately conservative: one MAC must account for a
+/// *majority* of the replies, because a handful of addresses legitimately
+/// sharing an address (a bridge with several IPs, say) is not an anomaly.
+fn warn_if_one_mac_answers_everything(plan: &ScanPlan, stats: &mut ScanStats, replies: &[Reply]) {
+    if replies.len() < 2 {
+        return;
+    }
+    let mut by_mac: HashMap<MacAddr, usize> = HashMap::new();
+    for reply in replies {
+        if let Some(mac) = reply.mac {
+            *by_mac.entry(mac).or_default() += 1;
+        }
+    }
+    let Some((&mac, &count)) = by_mac.iter().max_by_key(|(_, n)| **n) else {
+        return;
+    };
+    if count < 2 || count * 2 <= replies.len() {
+        return;
+    }
+    let msg = format!(
+        "{count} of {} arp replies came from the single hardware address {mac}, \
+         which is proxy-arp: one device answering for a range it routes rather \
+         than {count} separate hosts",
+        replies.len()
+    );
+    if plan.progress {
+        eprintln!("  warning: {msg}");
+    }
+    stats.note(msg);
+}
+
 /// Active ARP, restricted to addresses on a directly-attached link.
 ///
 /// ARP cannot be routed, so probing an off-subnet address is not merely
@@ -367,6 +421,7 @@ fn run_arp(
             let alive = match prober.probe_round(&on_link) {
                 Ok(replies) => {
                     let n = replies.len();
+                    warn_if_one_mac_answers_everything(plan, stats, &replies);
                     for reply in replies {
                         if let Some(mac) = reply.mac {
                             table.record_mac(reply.ip, mac);
@@ -608,8 +663,10 @@ mod tests {
 
     #[test]
     fn stats_account_for_every_address() {
+        // A /30 is 4 addresses of which .0 and .3 are network and broadcast, so
+        // the two in the middle are the whole scan.
         let report = run(&plan_for("127.0.0.0/30")).unwrap();
-        assert_eq!(report.stats.addresses, 4);
+        assert_eq!(report.stats.addresses, 2);
         assert!(
             report.elapsed.as_millis() < 5_000,
             "a /30 should be near-instant"
@@ -687,5 +744,72 @@ mod tests {
         // or every fast scan would gain a line of noise.
         let ticker = Ticker::start("test");
         ticker.stop();
+    }
+
+    fn arp_reply(ip: Ipv4Addr, mac: &str) -> Reply {
+        Reply::new(ip, Outcome::Alive).with_mac(MacAddr::parse(mac).unwrap())
+    }
+
+    #[test]
+    fn one_mac_answering_for_a_crowd_is_called_out_as_proxy_arp() {
+        // The shape seen on a real Windows scan: 40 replies, all one hardware
+        // address. That is a router answering for a range, not 40 hosts, and
+        // reporting it as such is the failure that matters.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let replies: Vec<Reply> = (1..=40u8)
+            .map(|i| arp_reply(Ipv4Addr::new(10, 0, 0, i), "aa:bb:cc:dd:ee:ff"))
+            .collect();
+
+        warn_if_one_mac_answers_everything(&plan, &mut stats, &replies);
+        assert!(
+            stats.notes.iter().any(|n| n.contains("proxy-arp")),
+            "expected a proxy-arp warning, got {:?}",
+            stats.notes
+        );
+    }
+
+    #[test]
+    fn a_normal_network_of_distinct_macs_is_not_warned_about() {
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let replies: Vec<Reply> = (1..=20u8)
+            .map(|i| {
+                arp_reply(
+                    Ipv4Addr::new(10, 0, 0, i),
+                    &format!("aa:bb:cc:dd:ee:{:02x}", i),
+                )
+            })
+            .collect();
+
+        warn_if_one_mac_answers_everything(&plan, &mut stats, &replies);
+        assert!(
+            stats.notes.is_empty(),
+            "distinct hardware addresses are ordinary, got {:?}",
+            stats.notes
+        );
+    }
+
+    #[test]
+    fn a_few_addresses_sharing_a_mac_is_not_an_anomaly() {
+        // Three addresses behind one bridge is normal; only a majority counts.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let mut replies: Vec<Reply> = (1..=3u8)
+            .map(|i| arp_reply(Ipv4Addr::new(10, 0, 0, i), "aa:bb:cc:dd:ee:01"))
+            .collect();
+        for i in 4..=20u8 {
+            replies.push(arp_reply(
+                Ipv4Addr::new(10, 0, 0, i),
+                &format!("aa:bb:cc:dd:ee:{:02x}", i),
+            ));
+        }
+
+        warn_if_one_mac_answers_everything(&plan, &mut stats, &replies);
+        assert!(
+            stats.notes.is_empty(),
+            "a minority share is not proxy-arp, got {:?}",
+            stats.notes
+        );
     }
 }
