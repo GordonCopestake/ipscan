@@ -208,20 +208,30 @@ mod platform {
     pub fn read() -> Result<Vec<super::Neighbour>> {
         const NO_ERROR: u32 = 0;
         const ERROR_BUFFER_OVERFLOW: u32 = 111;
+        const ERROR_NO_DATA: u32 = 232;
 
         let mut size: u32 = 0;
         let rc = unsafe { GetIpNetTable(None, &mut size, false) };
 
-        // An empty table is a normal state on a fresh machine, not a failure. So
-        // is being told how much room to reserve, which is the expected answer.
-        if size == 0 || (rc != ERROR_BUFFER_OVERFLOW && rc != NO_ERROR) {
+        // An empty table is a normal state on a fresh machine, but it is the one
+        // empty answer that is allowed to stay quiet. Everything else is a
+        // failure, and reporting it as "no entries" is what makes a broken read
+        // indistinguishable from a genuinely empty cache.
+        if rc == ERROR_NO_DATA || size == 0 {
             return Ok(Vec::new());
+        }
+        if rc != ERROR_BUFFER_OVERFLOW && rc != NO_ERROR {
+            anyhow::bail!("GetIpNetTable could not report the table size: error {rc}");
         }
 
         // The API is free to want more space on the second call than it reported
         // on the first, so keep some headroom rather than risk another overflow.
-        let mut buf = vec![0u8; size as usize + 4096];
-        let mut size = buf.len() as u32;
+        // Allocated as words rather than bytes because the table starts with a
+        // `u32` count and the API writes 32-bit fields through the pointer: a
+        // byte buffer has no alignment guarantee, and forming a reference to an
+        // under-aligned table is undefined behaviour.
+        let mut buf = vec![0u32; (size as usize + 4096).div_ceil(std::mem::size_of::<u32>())];
+        let mut size = (buf.len() * std::mem::size_of::<u32>()) as u32;
         let rc = unsafe {
             GetIpNetTable(
                 Some(buf.as_mut_ptr().cast::<MIB_IPNETTABLE>()),
@@ -230,7 +240,7 @@ mod platform {
             )
         };
         if rc != NO_ERROR {
-            return Ok(Vec::new());
+            anyhow::bail!("GetIpNetTable failed to read the table: error {rc}");
         }
 
         // Read the header, then the rows that follow. `table` is a one-element
@@ -238,7 +248,7 @@ mod platform {
         let table = unsafe { &*buf.as_ptr().cast::<MIB_IPNETTABLE>() };
         let num = table.dwNumEntries as usize;
         if num == 0 {
-            return Ok(Vec::new());
+            anyhow::bail!("GetIpNetTable reported {size} bytes but no rows in them");
         }
         let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), num) };
         Ok(rows.iter().filter_map(row_to_neighbour).collect())

@@ -20,7 +20,7 @@ use std::net::Ipv4Addr;
 
 use anyhow::Result;
 
-use super::{ProbeConfig, Reply};
+use super::{Outcome, ProbeConfig, Reply};
 
 /// Laid out by the platform backends.
 pub use imp::SocketKind;
@@ -520,6 +520,75 @@ mod imp {
 
 // ------------------------------------------------------------- windows ----
 
+/// What an `IcmpSendEcho2` status code means about the target.
+///
+/// The codes are fixed values from the Windows SDK, restated here so the rule
+/// can be tested on any host. Which of them count as proof that the target is
+/// there, and the requirement that the reply came from the target at all, are
+/// both easy to get subtly wrong and impossible to notice from one scan: a
+/// router answering echo for a range it only routes looks exactly like a room
+/// full of hosts.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_verdict(status: u32, answered_us: bool) -> Option<Outcome> {
+    const IP_SUCCESS: u32 = 0;
+    const IP_TTL_EXPIRED: u32 = 1;
+    const IP_DEST_NET_UNREACHABLE: u32 = 11001;
+    const IP_DEST_HOST_UNREACHABLE: u32 = 11004;
+    const IP_DEST_PROT_UNREACHABLE: u32 = 11010;
+
+    match status {
+        // IP_SUCCESS, and the reply came from the address we asked. A success
+        // status from any other address is a reply to somebody else's question,
+        // so it says nothing about this target.
+        IP_SUCCESS if answered_us => Some(Outcome::Alive),
+        IP_SUCCESS => None,
+        // IP_TTL_EXPIRED: it answered, but a router dropped the echo on the way
+        // back. That proves something is alive on the path, not the target, so
+        // it is not evidence about the target itself.
+        IP_TTL_EXPIRED => None,
+        // A router or the target answered with an error. That is a real response
+        // from the network, so the address is in use.
+        IP_DEST_NET_UNREACHABLE | IP_DEST_HOST_UNREACHABLE | IP_DEST_PROT_UNREACHABLE => {
+            Some(Outcome::Filtered)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod windows_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn success_from_the_target_is_alive() {
+        assert_eq!(windows_verdict(0, true), Some(Outcome::Alive));
+    }
+
+    #[test]
+    fn success_from_another_address_is_not_the_target() {
+        // The whole point: a device echoing on behalf of an address it merely
+        // routes must not be credited with that host.
+        assert_eq!(windows_verdict(0, false), None);
+    }
+
+    #[test]
+    fn unreachable_errors_still_mean_the_address_is_in_use() {
+        assert_eq!(windows_verdict(11001, false), Some(Outcome::Filtered));
+        assert_eq!(windows_verdict(11004, false), Some(Outcome::Filtered));
+        assert_eq!(windows_verdict(11010, false), Some(Outcome::Filtered));
+    }
+
+    #[test]
+    fn an_expired_echo_proves_the_path_not_the_target() {
+        assert_eq!(windows_verdict(1, true), None);
+    }
+
+    #[test]
+    fn unknown_codes_are_not_evidence() {
+        assert_eq!(windows_verdict(12345, true), None);
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::net::Ipv4Addr;
@@ -527,6 +596,7 @@ mod imp {
 
     use anyhow::{Context, Result};
 
+    use super::windows_verdict;
     use super::wire;
     use crate::host::Outcome;
     use crate::probe::{ProbeConfig, Reply};
@@ -711,11 +781,22 @@ mod imp {
         } else {
             Some(sent.elapsed())
         };
-        let ttl = u8::try_from(echo.Options.Ttl).ok();
+        // A TTL of zero was never set by a sender, so it means Windows left the
+        // field alone rather than that a packet arrived with a dead lifetime.
+        // Reporting it as a real TTL would be worse than admitting we have none.
+        let ttl = match echo.Options.Ttl {
+            0 => None,
+            n => u8::try_from(n).ok(),
+        };
+        // `Address` is who actually sent the reply, which is not necessarily who
+        // we asked. Something that answers echo on behalf of a range it merely
+        // routes would otherwise be credited with those hosts, on exactly the
+        // reasoning that made a proxy-arp segment look crowded.
+        let from = std::net::Ipv4Addr::from(echo.Address);
+        let answered_us = from == ip;
 
-        match echo.Status {
-            // IP_SUCCESS: the host echoed our request.
-            0 => Some(Reply {
+        match windows_verdict(echo.Status, answered_us) {
+            Some(Outcome::Alive) => Some(Reply {
                 ip,
                 outcome: Outcome::Alive,
                 rtt,
@@ -723,27 +804,17 @@ mod imp {
                 port: None,
                 mac: None,
             }),
-            // IP_TTL_EXPIRED: it answered, but a router dropped the echo on the
-            // way back. That still proves something is alive on the path, but
-            // not the target, so it is not evidence about the target itself.
-            1 => None,
-            // The target or a router in the way answered with an error. That is
-            // a real response from the network, so the address is in use.
-            code if code == IP_DEST_HOST_UNREACHABLE
-                || code == IP_DEST_PROT_UNREACHABLE
-                || code == IP_DEST_NET_UNREACHABLE =>
-            {
-                Some(Reply {
-                    ip,
-                    outcome: Outcome::Filtered,
-                    rtt: None,
-                    ttl,
-                    port: None,
-                    mac: None,
-                })
-            }
-            // IP_REQ_TIMED_OUT and anything else: no information whatsoever.
-            _ => None,
+            Some(outcome) => Some(Reply {
+                ip,
+                outcome,
+                rtt,
+                ttl,
+                port: None,
+                mac: None,
+            }),
+            // Either the target did not answer, or somebody who is not the target
+            // did. Neither is evidence about the target.
+            None => None,
         }
     }
 }

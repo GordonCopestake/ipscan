@@ -309,6 +309,22 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
     hosts.sort_by_key(|h| u32::from(h.ip));
 
+    // ARP is the only phase that can name a host, so a later phase settling an
+    // address ARP never claimed leaves a row with a dash where the hardware
+    // address should be. Worth one line, because a dash there reads as "no device
+    // answered" when the likelier truth is "arp was answered for some of these
+    // and not the others", which is a different problem with a different fix.
+    let nameless = hosts.iter().filter(|h| h.mac.is_none()).count();
+    if plan.progress && nameless > 0 && nameless < hosts.len() {
+        eprintln!(
+            "  note: {nameless} of the {} live host{} were settled without a hardware \
+             address, meaning arp did not answer for them; they are listed with a \
+             dash in the mac column",
+            hosts.len(),
+            if hosts.len() == 1 { "" } else { "s" }
+        );
+    }
+
     if plan.progress {
         eprintln!(
             "done: {} host{} in {}",
