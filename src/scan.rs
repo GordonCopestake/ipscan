@@ -290,31 +290,77 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         }
     }
 
-    // ------------------------------------------------- neighbour re-read ----
-    // After the sweep the table holds resolutions our own probes caused, so this
-    // is a consequence of the scan rather than a stale guess.
-    let after = neighbour::read_table().unwrap_or_default();
-    let mut macs_added = 0usize;
-    for n in &after {
-        if !seed.contains(&n.ip) {
-            macs_added += 1;
-        }
-        table.record_mac(n.ip, n.mac);
-    }
-    if plan.progress && macs_added > 0 {
-        eprintln!("resolved {macs_added} hardware addresses from the neighbour cache");
-    }
+    // The targets for which a hardware address is meaningful, and so the only
+    // ones whose liveness has to be explained by something other than a later
+    // probe. Off-link and loopback are exempt: no ARP exchange could ever name
+    // them, and with the phase deliberately skipped the cache is the only source
+    // available.
+    let arp_ran = matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto);
+    let eligible = if arp_ran {
+        arp_eligible(plan, &all)
+    } else {
+        HashSet::new()
+    };
 
-    // Addresses the cache knows but no probe confirmed.
-    if plan.include_cached {
-        for n in &after {
-            if !table.alive().iter().any(|h| h.ip == n.ip) {
-                table.record(
-                    n.ip,
-                    crate::host::Evidence::new(Method::Neighbour, Outcome::Alive),
-                );
+    // ------------------------------------------------ late attribution ----
+    // Reading the neighbour table again once the probes are done is not
+    // redundant. Sending an echo to a host on our own link requires having
+    // resolved it first, so every host that answered at all has a hardware
+    // address in the table by now -- including the ones the concurrent sweep lost
+    // a reply for, which is easy to do when a few hundred requests saturate the
+    // reply path. On a real Windows scan this recovered a host the sweep had
+    // missed but the OS had, the difference between a census of 115 and of 116.
+    //
+    // On a platform where the sweep cannot run at all it matters even more: the
+    // passive table is then the *only* source of hardware addresses, and without
+    // this pass a scan on Linux reports live hosts with no device behind them and
+    // no way to say which one.
+    //
+    // A direct reply still wins. `record_mac_if_absent` refuses to overwrite an
+    // address the sweep already named, because a reply we asked for is better
+    // evidence than an entry we merely read, and it only counts hosts that
+    // actually gained something, so the number reported is the number of hosts
+    // rescued rather than the size of the table.
+    let mut resolved_from_cache = 0usize;
+    match neighbour::read_table() {
+        Ok(entries) => {
+            for n in &entries {
+                // An all-zero address is an entry the OS never finished
+                // resolving, not a device, so it cannot attribute anything.
+                if !n.mac.is_unspecified() && table.record_mac_if_absent(n.ip, n.mac) {
+                    resolved_from_cache += 1;
+                }
+            }
+            // Addresses the table knows but no probe confirmed. Kept out of the
+            // default view unless asked for, since a cache entry is weaker
+            // evidence of life than a reply.
+            if plan.include_cached {
+                for n in &entries {
+                    if !table.alive().iter().any(|h| h.ip == n.ip) {
+                        table.record(
+                            n.ip,
+                            crate::host::Evidence::new(Method::Neighbour, Outcome::Alive),
+                        );
+                    }
+                }
             }
         }
+        Err(e) => stats.note(format!(
+            "neighbour table re-read after probing failed: {e:#}"
+        )),
+    }
+    if resolved_from_cache > 0 && plan.progress {
+        eprintln!(
+            "  attributed {resolved_from_cache} host{} from the neighbour table",
+            if resolved_from_cache == 1 { "" } else { "s" }
+        );
+    }
+    if resolved_from_cache > 0 {
+        stats.note(format!(
+            "attributed {resolved_from_cache} host{} from the neighbour table that the \
+             arp sweep had not answered for",
+            if resolved_from_cache == 1 { "" } else { "s" }
+        ));
     }
 
     // ------------------------------------------------------- hostnames ----
@@ -349,63 +395,6 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // The ratio has to be a crowd as well. A handful of addresses that dropped an
     // ARP reply is ordinary, and hiding a real machine because of a heuristic is
     // worse than listing it with a dash.
-    let arp_ran = matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto);
-    let eligible = if arp_ran {
-        arp_eligible(plan, &all)
-    } else {
-        HashSet::new()
-    };
-
-    // ------------------------------------------------ late arp recovery ----
-    // A later phase resolves addresses the ARP phase failed to. Sending an echo
-    // to a host on our own link requires having resolved it first, so by the time
-    // the probes are done the stack holds hardware addresses for every live host
-    // that genuinely exists -- including any the concurrent ARP sweep lost a
-    // reply for.
-    //
-    // That is worth a second look, because losing one is easy: a sweep of a few
-    // hundred addresses saturates the reply path, and a real machine is then
-    // indistinguishable from an address nothing owns. On a real Windows scan the
-    // difference was one host the sweep missed that the OS cache had, and this
-    // is what puts it back. The cost is one table read, which is instant.
-    //
-    // It only ever *adds* attribution. A device that never resolved anything has
-    // no entry, so an address nothing owns stays unattributed -- which is the
-    // whole point of withholding them.
-    if arp_ran && !eligible.is_empty() {
-        match neighbour::read_table() {
-            Ok(entries) => {
-                let mut learned = 0usize;
-                for n in entries {
-                    // An unspecified address is an entry Windows never finished
-                    // resolving, not a device, so it cannot attribute anything.
-                    let usable = eligible.contains(&n.ip) && !n.mac.is_unspecified();
-                    if usable && table.record_mac_if_absent(n.ip, n.mac) {
-                        learned += 1;
-                    }
-                }
-                if learned > 0 {
-                    if plan.progress {
-                        eprintln!(
-                            "  arp: recovered the hardware address of {} host{} from \
-                             the neighbour cache",
-                            learned,
-                            if learned == 1 { "" } else { "s" }
-                        );
-                    }
-                    stats.note(format!(
-                        "recovered {learned} hardware address{} from the neighbour cache \
-                         after probing, which arp had not answered for",
-                        if learned == 1 { "" } else { "es" }
-                    ));
-                }
-            }
-            Err(e) => stats.note(format!(
-                "neighbour cache re-read after probing failed: {e:#}"
-            )),
-        }
-    }
-
     let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
     hosts.sort_by_key(|h| u32::from(h.ip));
     let (attributed, unattributed) = split_by_attribution(&hosts, &eligible);
@@ -557,17 +546,26 @@ fn tcp_targets(
 }
 
 /// Whether anything in the sweep can say *which device* answered this address.
+/// Whether a live host can be tied to a device.
 ///
-/// ARP is the only phase that learns a hardware address, so an address it never
-/// named is one whose liveness came from a later phase alone. That is not
-/// automatically suspicious: off-link, or with the ARP phase deliberately skipped,
-/// ICMP and TCP are the only evidence available and are as good as it gets.
+/// The question is whether a hardware address is known for the address, not
+/// whether the active sweep was the thing that learned it. Those come apart in
+/// two directions, and getting it wrong in either is a lie the operator cannot
+/// see:
 ///
-/// So this asks a narrower question than "is it alive" -- it asks whether the
-/// sweep established a device, and it is only ever consulted where the ARP phase
-/// actually ran and could have said so.
+/// - Where the sweep cannot run, the passive neighbour table is the only source
+///   of hardware addresses. Demanding `Method::Arp` evidence there means a Linux
+///   scan prints a column full of addresses and then warns that none of them can
+///   be attributed to anything.
+/// - Where the sweep ran and lost a reply, the address can still be resolved from
+///   the table afterwards.
+///
+/// So this asks the same question the output column answers, and it rejects the
+/// all-zero address here as well as where the table is read: "a hardware address
+/// is known" should not be satisfiable by a row the OS never finished resolving,
+/// however that row reached us.
 fn is_attributable(host: &Host) -> bool {
-    host.evidence.iter().any(|e| e.method == Method::Arp)
+    host.mac.is_some_and(|m| !m.is_unspecified())
 }
 
 /// The targets for which an ARP exchange is meaningful.
@@ -645,35 +643,51 @@ fn warn_about_unattributable_hosts(
     }
     let named = attributed.len();
 
-    // Round-trip times are the evidence, so report what they look like rather
-    // than asserting a cause.
+    // Round-trip times are corroboration, and they only corroborate one story if
+    // they actually have the shape of that story. A device replying on a fixed
+    // schedule produces times that bunch; real machines at different distances
+    // produce times that spread. Reporting a wide spread as the signature of a
+    // single responder would be reading a number backwards, and the spread is
+    // the number a reader is most likely to check against the table below.
     let mut rtts: Vec<u128> = ghosts
         .iter()
         .filter_map(|h| h.evidence.iter().find_map(|e| e.rtt))
         .map(|d| d.as_millis())
         .collect();
     rtts.sort_unstable();
-    let spread = match (rtts.first(), rtts.last()) {
-        (Some(lo), Some(hi)) => format!("{lo:.1}ms to {hi:.1}ms"),
-        _ => "unavailable".to_string(),
+    let timing = match (rtts.first().copied(), rtts.len()) {
+        (None, _) => "No round-trip time was recorded for them".to_string(),
+        (Some(lo), 1) => format!("The only round-trip time recorded was {lo:.1}ms"),
+        (Some(lo), _) => {
+            let hi = rtts[rtts.len() - 1];
+            let text = format!("Their round-trip times span {lo:.1}ms to {hi:.1}ms");
+            // Times within a factor of two of each other are a cluster; wider
+            // than that is ordinary variation between machines.
+            if hi <= lo.saturating_mul(2) {
+                format!("{text}, which is what one device replying on a schedule looks like")
+            } else {
+                format!(
+                    "{text}, which is the spread real machines at different distances \
+                     produce rather than the bunching of a single responder"
+                )
+            }
+        }
     };
     let msg = format!(
-        "{} of the {} live host{} cannot be attributed to a device: arp did not \
-         name them, so nothing here can say which device they are. On a \
-         directly-attached link that combination is contradictory, because \
-         answering icmp requires having resolved the target's hardware address \
-         first. Something is answering echo on behalf of {} addresses it does \
-         not own, or arp lost {} replies. Their round-trip times span {}, \
-         which is the signature of a single periodic responder rather than {} \
-         separate machines. Only the {} host{} arp named should be counted as \
-         a host census; treat the rest as unverified.",
+        "{} of the {} live host{} cannot be attributed to a device: no hardware \
+         address is known for them, so nothing here can say which device they \
+         are. On a directly-attached link that combination is contradictory, \
+         because answering icmp requires having resolved the target's hardware \
+         address first. Something is answering echo on behalf of {} addresses \
+         it does not own, or the sweep lost {} replies. {}. Only the {} host{} \
+         that were attributed should be counted as a host census; treat the rest \
+         as unverified.",
         ghosts.len(),
         hosts.len(),
         if hosts.len() == 1 { "" } else { "s" },
         ghosts.len(),
         ghosts.len(),
-        spread,
-        ghosts.len(),
+        timing,
         named,
         if named == 1 { "" } else { "s" },
     );
@@ -1194,6 +1208,80 @@ mod tests {
                 .any(|n| n.contains("cannot be attributed")),
             "a zero hardware address must not count as a name, got {:?}",
             stats.notes
+        );
+    }
+
+    #[test]
+    fn a_host_attributed_by_the_neighbour_table_is_not_a_ghost() {
+        // Regression. Attribution used to require `Method::Arp` evidence, which is
+        // wrong wherever the passive table is the source: on Linux without
+        // CAP_NET_RAW the sweep cannot run, so a scan printed a column full of
+        // hardware addresses and then warned that none of the hosts could be
+        // attributed to a device, ending with "Only the 0 hosts arp named".
+        //
+        // The table is the only source there, and an address it knows is a
+        // device, so a host with a hardware address and no arp evidence is
+        // attributed.
+        let mut hosts = split_hosts(0, 3, 40);
+        for h in hosts.iter_mut() {
+            h.mac = Some(MacAddr([9, 8, 7, 6, 5, 4]));
+        }
+        let eligible = all_eligible(&hosts);
+        let (attributed, unattributed) = split_by_attribution(&hosts, &eligible);
+        assert_eq!(attributed.len(), 3, "a known address is a device");
+        assert!(unattributed.is_empty());
+
+        // And the warning must stay quiet about it, rather than accusing a scan
+        // whose table plainly shows the addresses.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &eligible);
+        assert!(
+            !stats
+                .notes
+                .iter()
+                .any(|n| n.contains("cannot be attributed")),
+            "every host has a hardware address, so there is nothing to warn about: {:?}",
+            stats.notes
+        );
+    }
+
+    #[test]
+    fn a_wide_round_trip_spread_is_not_reported_as_one_responder() {
+        // The warning claimed a "signature of a single periodic responder" for
+        // whatever spread it was handed. On a wireless network that is 2ms to
+        // 367ms -- ordinary distance variation between real machines -- and the
+        // sentence was reading the number backwards.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        // One attributed host, and ghosts at a gateway's distance and a laptop's.
+        let mut hosts = split_hosts(1, 3, 900);
+        for (i, ms) in [2u64, 40, 367].iter().enumerate() {
+            hosts[1 + i].evidence[0].rtt = Some(Duration::from_millis(*ms));
+        }
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &all_eligible(&hosts));
+        let note = stats
+            .notes
+            .iter()
+            .find(|n| n.contains("cannot be attributed"))
+            .expect("three of four hosts is a crowd");
+        assert!(
+            note.contains("spread real machines at different distances"),
+            "a wide spread must be reported as variation, not as one device: {note}"
+        );
+
+        // The clustered case keeps the accusation, because there it fits.
+        let mut stats = ScanStats::default();
+        let hosts = split_hosts(1, 3, 900);
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &all_eligible(&hosts));
+        let note = stats
+            .notes
+            .iter()
+            .find(|n| n.contains("cannot be attributed"))
+            .expect("three of four hosts is a crowd");
+        assert!(
+            note.contains("one device replying on a schedule"),
+            "a tight cluster is still reported as one device: {note}"
         );
     }
 

@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.1.6-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.1.6-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.1.7-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.1.7-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.1.6-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.1.7-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.1.6
+ipscan 0.1.7
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
@@ -313,6 +313,20 @@ It only ever adds attribution, never removes it. A direct ARP reply is stronger
 evidence than a cache entry, so a known address is never overwritten, and an
 address nothing owns has no entry to be found in. There is no reason to switch it
 off, so there is no switch.
+
+The warning that used to say "Only the 0 hosts arp named should be counted"
+was wrong on any platform where the active sweep cannot run. On Linux without
+CAP_NET_RAW the neighbour table is the only source of hardware addresses, so
+a scan that printed a column full of addresses would then accuse its own
+output. Attribution is now "a hardware address is known", not "the active
+sweep said so". A zero address still counts as nothing, because an entry the
+OS never finished resolving is not a device.
+
+The single-responder claim is now conditional. Round-trip times that bunch
+together (within a factor of two) are reported as what one device replying on
+a schedule looks like. Times that spread wider are reported as what real
+machines at different distances produce -- which is evidence the ghosts are
+*not* a single device, and the warning says so.
 
 ### `-p` is a question about ports, not a fallback
 

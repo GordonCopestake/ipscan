@@ -109,6 +109,11 @@ struct ReportJson {
     hosts_alive: usize,
     elapsed_ms: u128,
     hosts: Vec<HostJson>,
+    /// Addresses that answered but could not be tied to a device, and were
+    /// withheld from `hosts`. Reported so that a consumer counting `hosts` knows
+    /// it is not the whole census, exactly as the text summary says out loud.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unverified_omitted: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
 }
@@ -313,6 +318,8 @@ fn render_json(report: &ScanReport, hosts: &[&Host], opts: &OutputOptions) -> Re
                 hosts_alive: host_json.len(),
                 elapsed_ms: report.elapsed.as_millis(),
                 hosts: host_json,
+                unverified_omitted: (report.stats.unverified_omitted > 0)
+                    .then_some(report.stats.unverified_omitted),
                 notes: if opts.notes {
                     report.stats.notes.clone()
                 } else {
@@ -758,6 +765,31 @@ mod tests {
             first["probes"].is_array(),
             "per-probe detail must be present"
         );
+        // A clean scan withholds nothing, so the field stays out of the way.
+        assert!(
+            v.get("unverified_omitted").is_none(),
+            "an unremarkable scan must not carry a key it has nothing to say about"
+        );
+    }
+
+    #[test]
+    fn json_says_how_many_hosts_were_withheld() {
+        // The text summary states this out loud, so the machine-readable form has
+        // to carry it too: a consumer counting `hosts` is otherwise reading a
+        // censored list as if it were the census.
+        let mut report = sample();
+        report.stats.unverified_omitted = 137;
+        let out = render(
+            &report,
+            &OutputOptions {
+                format: Format::Json,
+                summary: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["unverified_omitted"], 137);
     }
 
     #[test]
