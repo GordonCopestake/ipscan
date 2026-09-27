@@ -49,7 +49,7 @@ jobs:
 
       # Temporary: is a loader failure specific to this crate, or does a trivial
       # binary fail the same way on this runner image?
-      - name: Baseline: does a hello-world crate load?
+      - name: "Baseline - does a hello-world crate load?"
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
