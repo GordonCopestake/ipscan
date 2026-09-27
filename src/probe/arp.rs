@@ -504,7 +504,7 @@ mod platform {
 
         let mac = crate::host::MacAddr::from_bytes(mac);
         // Broadcast and all-zero are addresses, not hosts.
-        if mac.is_broadcast() || mac.0 == [0; 6] {
+        if mac.is_broadcast() || mac.is_unspecified() {
             return None;
         }
         Some(mac)

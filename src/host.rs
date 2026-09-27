@@ -212,12 +212,16 @@ impl Host {
     }
 
     /// Fold a MAC in, if we learned one and did not have it before.
+    ///
+    /// A changed MAC for the same IP means the address was reassigned (DHCP
+    /// turnover, a mobile device rejoining, etc.). The new value replaces the
+    /// old one because the change itself is a signal worth reporting.
     pub fn set_mac(&mut self, mac: MacAddr) {
         if let Some(existing) = self.mac
             && existing != mac
         {
-            // A changed MAC for the same IP means DHCP moved the address. Keep
-            // the newer value; the change is itself a signal worth reporting.
+            // MAC changed for this IP: record the new value. The change is a
+            // signal that the address was reassigned.
         }
         self.mac = Some(mac);
     }

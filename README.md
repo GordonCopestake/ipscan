@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.1.7-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.1.7-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.1.8-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.1.8-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.1.7-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.1.8-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.1.7
+ipscan 0.1.8
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
@@ -327,6 +327,22 @@ together (within a factor of two) are reported as what one device replying on
 a schedule looks like. Times that spread wider are reported as what real
 machines at different distances produce -- which is evidence the ghosts are
 *not* a single device, and the warning says so.
+
+### `-p` now means "probe these ports on every live host"
+
+The cascade only spends a TCP connect on addresses nothing else answered for,
+which is what makes it cheap and is the right behaviour when the question is "who
+is here". But `-p 80,443` is a question about those ports, and "ARP already found
+this host" is not an answer to it. So naming ports includes the hosts already
+known to be alive:
+
+```
+ipscan -p 80,443 192.168.1.0/24     # probes both ports on every live host
+ipscan 192.168.1.0/24               # probes ports only where nothing else answered
+```
+
+Addresses already shown to be dead are still skipped either way. Naming ports
+never turns into spending connects on addresses that have proved empty.
 
 ### `-p` is a question about ports, not a fallback
 

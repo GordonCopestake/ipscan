@@ -188,8 +188,9 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     let mut settled: HashSet<Ipv4Addr> = HashSet::new();
 
     // ------------------------------------------------------------- ARP ----
+    let mut arp_actually_ran = false;
     if matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto) {
-        run_arp(plan, &all, &mut table, &mut stats, &mut settled);
+        arp_actually_ran = run_arp(plan, &all, &mut table, &mut stats, &mut settled);
     }
 
     // ------------------------------------------------------------ ICMP ----
@@ -245,19 +246,17 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // already known to be dead are skipped.
     if matches!(plan.method, MethodChoice::Tcp | MethodChoice::Auto) {
         let live: HashSet<Ipv4Addr> = table.alive().iter().map(|h| h.ip).collect();
-        let (targets_for_tcp, skipping_known_dead) =
-            tcp_targets(plan.ports_explicit, &all, &settled, &live);
+        let (targets_for_tcp, known_live) = tcp_targets(plan.ports_explicit, &all, &settled, &live);
         if !targets_for_tcp.is_empty() {
             stats.escalated_to_tcp = targets_for_tcp.len();
             if plan.progress {
-                if skipping_known_dead > 0 {
+                if known_live > 0 {
                     eprintln!(
-                        "probing {} of the {} live host{} on the named ports, plus \
+                        "probing {} live host{} on the named ports, plus \
                          {} that nothing answered for...",
-                        skipping_known_dead,
-                        skipping_known_dead,
-                        if skipping_known_dead == 1 { "" } else { "s" },
-                        targets_for_tcp.len() - skipping_known_dead,
+                        known_live,
+                        if known_live == 1 { "" } else { "s" },
+                        targets_for_tcp.len() - known_live,
                     );
                 } else {
                     eprintln!(
@@ -267,7 +266,7 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
                 }
             }
             let before = settled.len();
-            let attempts = targets_for_tcp.len() * TcpProber::new(&plan.config).ports().len();
+            let attempts = targets_for_tcp.len() * plan.config.ports.len();
             let ticker = Ticker::start("tcp");
             let phase_started = Instant::now();
             let mut prober = TcpProber::new(&plan.config);
@@ -295,8 +294,7 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // probe. Off-link and loopback are exempt: no ARP exchange could ever name
     // them, and with the phase deliberately skipped the cache is the only source
     // available.
-    let arp_ran = matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto);
-    let eligible = if arp_ran {
+    let eligible = if arp_actually_ran {
         arp_eligible(plan, &all)
     } else {
         HashSet::new()
@@ -321,13 +319,21 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // evidence than an entry we merely read, and it only counts hosts that
     // actually gained something, so the number reported is the number of hosts
     // rescued rather than the size of the table.
+    //
+    // We restrict to `eligible` (on-link, non-loopback) because off-link and
+    // loopback addresses never require an ARP exchange -- answering an echo to
+    // 127.0.0.1 never touches a wire, so the neighbour table has no business
+    // naming it. Attributing a MAC there would be a phantom device.
     let mut resolved_from_cache = 0usize;
     match neighbour::read_table() {
         Ok(entries) => {
             for n in &entries {
                 // An all-zero address is an entry the OS never finished
                 // resolving, not a device, so it cannot attribute anything.
-                if !n.mac.is_unspecified() && table.record_mac_if_absent(n.ip, n.mac) {
+                if eligible.contains(&n.ip)
+                    && !n.mac.is_unspecified()
+                    && table.record_mac_if_absent(n.ip, n.mac)
+                {
                     resolved_from_cache += 1;
                 }
             }
@@ -335,8 +341,9 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
             // default view unless asked for, since a cache entry is weaker
             // evidence of life than a reply.
             if plan.include_cached {
+                let alive_ips: HashSet<Ipv4Addr> = table.alive().iter().map(|h| h.ip).collect();
                 for n in &entries {
-                    if !table.alive().iter().any(|h| h.ip == n.ip) {
+                    if !alive_ips.contains(&n.ip) {
                         table.record(
                             n.ip,
                             crate::host::Evidence::new(Method::Neighbour, Outcome::Alive),
@@ -545,7 +552,6 @@ fn tcp_targets(
     (targets, n)
 }
 
-/// Whether anything in the sweep can say *which device* answered this address.
 /// Whether a live host can be tied to a device.
 ///
 /// The question is whether a hardware address is known for the address, not
@@ -717,13 +723,14 @@ fn should_withhold(attributed: usize, unattributed: usize, include_unverified: b
         && unattributed * 2 > attributed + unattributed
 }
 
+/// Returns whether the ARP phase actually executed (prober available and ran).
 fn run_arp(
     plan: &ScanPlan,
     all: &[Ipv4Addr],
     table: &mut HostTable,
     stats: &mut ScanStats,
     settled: &mut HashSet<Ipv4Addr>,
-) {
+) -> bool {
     let on_link: Vec<Ipv4Addr> = {
         let eligible = arp_eligible(plan, all);
         if eligible.is_empty() {
@@ -732,7 +739,7 @@ fn run_arp(
                     "active arp skipped: no interface selected, so on-link targets are unknown",
                 );
             }
-            return;
+            return false;
         }
         let mut v: Vec<Ipv4Addr> = all
             .iter()
@@ -747,13 +754,13 @@ fn run_arp(
         stats.arp_unreachable = off_link;
     }
     if on_link.is_empty() {
-        return;
+        return false;
     }
 
     let availability = ArpProber::availability();
     if !availability.available {
         stats.note(format!("active arp unavailable: {}", availability.reason));
-        return;
+        return false;
     }
 
     match ArpProber::new(&plan.config) {
@@ -789,8 +796,12 @@ fn run_arp(
                     human(phase_started.elapsed())
                 );
             }
+            true
         }
-        Err(e) => stats.note(format!("active arp unavailable: {e:#}")),
+        Err(e) => {
+            stats.note(format!("active arp unavailable: {e:#}"));
+            false
+        }
     }
 }
 
@@ -954,6 +965,15 @@ impl Ticker {
     }
 
     fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
