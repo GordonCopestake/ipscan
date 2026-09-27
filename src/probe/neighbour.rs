@@ -274,7 +274,7 @@ mod platform {
         let mut bytes = [0u8; 6];
         bytes[..len].copy_from_slice(&row.bPhysAddr[..len]);
         let mac = crate::host::MacAddr::from_bytes(bytes);
-        if mac.is_broadcast() {
+        if mac.is_broadcast() || mac.is_unspecified() {
             return None;
         }
 

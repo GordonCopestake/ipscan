@@ -178,7 +178,7 @@ Pick the interface, the ports, or the method:
 
 ```
 ipscan -i eth0                  # force the interface and its subnet
-ipscan -p 22,80,443             # TCP ports for the last resort
+ipscan -p 22,80,443             # probe these ports on every live host
 ipscan -m icmp                  # skip ARP and TCP entirely
 ipscan --timeout 500 --retries 0
 ```
@@ -201,6 +201,7 @@ Other useful flags:
 ipscan -L                       # list interfaces and their subnets
 ipscan --dns                    # reverse-resolve (slower)
 ipscan --cached                 # also show addresses only the OS cache knows
+ipscan --include-unverified     # list answers nothing could be attributed to
 ipscan --sort rtt               # order by latency, ip, or hostname
 ipscan -q                       # no summary line
 ipscan -v                       # per-stage progress and notes
@@ -280,6 +281,35 @@ hosts arp named should be counted as a host census; treat the rest as unverified
 The warning is deliberately quiet about a handful of unnamed hosts. A busy
 machine that dropped one ARP reply is ordinary, and a warning that fires on
 ordinary noise teaches you to ignore the warning that matters.
+
+Because such an answer is not a finding, it is not listed by default either. The
+shorter list is the one worth reading, and the summary always states how many were
+withheld, so the default view never loses an address silently. `--include-unverified`
+puts them back.
+
+Two guards keep that from becoming a way of hiding real machines. Loopback and
+off-link addresses are never held to it, because ARP could not have named them in
+the first place — a packet to `127.0.0.0/8` never reaches a wire, so demanding a
+hardware address for it demands the impossible. And if ARP named *nothing at all*,
+the phase is ineffective rather than authoritative, so the answers are kept and
+the failure is reported instead. Otherwise a virtual interface that cannot do ARP
+would turn a working scan into an empty one.
+
+### `-p` is a question about ports, not a fallback
+
+The cascade only spends a TCP connect on addresses nothing else answered for,
+which is what makes it cheap and is the right behaviour when the question is "who
+is here". But `-p 80,443` is a question about those ports, and "ARP already found
+this host" is not an answer to it. So naming ports includes the hosts already
+known to be alive:
+
+```
+ipscan -p 80,443 192.168.1.0/24     # probes both ports on every live host
+ipscan 192.168.1.0/24               # probes ports only where nothing else answered
+```
+
+Addresses already shown to be dead are still skipped either way. Naming ports
+never turns into spending connects on addresses that have proved empty.
 
 ## Licence
 

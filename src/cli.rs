@@ -98,6 +98,17 @@ pub struct Cli {
     #[arg(long)]
     pub cached: bool,
 
+    /// List addresses that answered but which nothing attributed to a device.
+    ///
+    /// Withheld by default. An address that answers ICMP on a directly-attached
+    /// link without ARP having named it is a contradiction: answering the echo
+    /// required resolving the target's hardware address first. A device echoing
+    /// on behalf of a range it merely routes produces exactly this, so counting
+    /// those answers as hosts reports a segment far fuller than it is. The count
+    /// is always in the summary, so nothing is lost by leaving them out.
+    #[arg(long)]
+    pub include_unverified: bool,
+
     /// Suppress the summary line.
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -196,6 +207,8 @@ impl Cli {
             interface: iface,
             resolve_hostnames: self.dns,
             include_cached: self.cached,
+            ports_explicit: self.ports.is_some(),
+            include_unverified: self.include_unverified,
             progress: self.wants_progress(),
         }
     }

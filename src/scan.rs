@@ -84,6 +84,22 @@ pub struct ScanPlan {
     pub resolve_hostnames: bool,
     /// Include addresses known only to the neighbour cache, flagged as cached.
     pub include_cached: bool,
+    /// The user named ports with `-p`, rather than taking the default list.
+    ///
+    /// This changes what the TCP phase is for. Left to itself the cascade only
+    /// spends a connect on addresses nothing else answered for, which is the
+    /// right way to find out who is there. But someone who names ports is
+    /// asking which ports are open, and skipping the check because a host
+    /// already answered ARP is answering a question they did not ask.
+    pub ports_explicit: bool,
+    /// List addresses that answered but which nothing could be attributed to.
+    ///
+    /// Off by default, because a host that answered ICMP on a directly-attached
+    /// link without ARP having named it is a contradiction rather than a finding.
+    /// Listing it alongside real hosts turns "who is here" into a number that
+    /// cannot be believed. They are counted in the summary either way, so
+    /// nothing is hidden -- it is only kept out of the list by default.
+    pub include_unverified: bool,
     /// Emit progress to stderr.
     pub progress: bool,
 }
@@ -99,6 +115,9 @@ pub struct ScanStats {
     pub escalated_to_tcp: usize,
     /// Addresses skipped by ARP because they are not on a directly-attached link.
     pub arp_unreachable: usize,
+    /// Answers withheld from the default listing because nothing attributed them
+    /// to a device. Counted rather than discarded, so the summary can say so.
+    pub unverified_omitted: usize,
     /// Diagnostics: skipped methods, degraded paths, hints.
     pub notes: Vec<String>,
 }
@@ -215,30 +234,45 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     }
 
     // ------------------------------------------------------------- TCP ----
-    // Only the residue. These are addresses nothing has answered for, which is
-    // the whole point: spending a connect on an already-confirmed host wastes
-    // both time and a few packets on the target.
+    // The residue by default: addresses nothing has answered for, which is the
+    // whole point of escalating. Spending a connect on an already-confirmed host
+    // wastes both time and a few packets on the target.
+    //
+    // Naming ports with `-p` is a different request. The cascade is a way of
+    // answering "who is here", but a named port is a question about that port,
+    // and the fact that ARP already found the host is not an answer to it. So
+    // with explicit ports the live set is probed too, and only the addresses
+    // already known to be dead are skipped.
     if matches!(plan.method, MethodChoice::Tcp | MethodChoice::Auto) {
-        let residue: Vec<Ipv4Addr> = all
-            .iter()
-            .copied()
-            .filter(|ip| !settled.contains(ip))
-            .collect();
-        if !residue.is_empty() {
-            stats.escalated_to_tcp = residue.len();
+        let live: HashSet<Ipv4Addr> = table.alive().iter().map(|h| h.ip).collect();
+        let (targets_for_tcp, skipping_known_dead) =
+            tcp_targets(plan.ports_explicit, &all, &settled, &live);
+        if !targets_for_tcp.is_empty() {
+            stats.escalated_to_tcp = targets_for_tcp.len();
             if plan.progress {
-                eprintln!(
-                    "icmp gave no answer for {} addresses, trying tcp...",
-                    residue.len()
-                );
+                if skipping_known_dead > 0 {
+                    eprintln!(
+                        "probing {} of the {} live host{} on the named ports, plus \
+                         {} that nothing answered for...",
+                        skipping_known_dead,
+                        skipping_known_dead,
+                        if skipping_known_dead == 1 { "" } else { "s" },
+                        targets_for_tcp.len() - skipping_known_dead,
+                    );
+                } else {
+                    eprintln!(
+                        "icmp gave no answer for {} addresses, trying tcp...",
+                        targets_for_tcp.len()
+                    );
+                }
             }
             let before = settled.len();
-            let attempts = residue.len() * TcpProber::new(&plan.config).ports().len();
+            let attempts = targets_for_tcp.len() * TcpProber::new(&plan.config).ports().len();
             let ticker = Ticker::start("tcp");
             let phase_started = Instant::now();
             let mut prober = TcpProber::new(&plan.config);
             stats.tcp_connections += attempts as u64;
-            for reply in prober.probe_round(&residue)? {
+            for reply in prober.probe_round(&targets_for_tcp)? {
                 record(&mut table, &mut settled, reply, Method::Tcp);
             }
             for f in prober.failures() {
@@ -308,16 +342,76 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
 
     let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
     hosts.sort_by_key(|h| u32::from(h.ip));
+    // Addresses that answered a later phase without ARP naming them are kept out
+    // of the default list, but only inside the set where ARP could have named
+    // them. `eligible` is that set: on-link, non-loopback, and only when the ARP
+    // phase was going to run. With `-m icmp` it is empty, so a sweep that worked
+    // exactly as asked still reports everything it found.
+    //
+    // The ratio has to be a crowd as well. A handful of addresses that dropped an
+    // ARP reply is ordinary, and hiding a real machine because of a heuristic is
+    // worse than listing it with a dash.
+    let arp_ran = matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto);
+    let eligible = if arp_ran {
+        arp_eligible(plan, &all)
+    } else {
+        HashSet::new()
+    };
+    let (attributed, unattributed) = split_by_attribution(&hosts, &eligible);
 
-    warn_about_unattributable_hosts(plan, &mut stats, &hosts);
+    warn_about_unattributable_hosts(plan, &mut stats, &hosts, &eligible);
+
+    let drop_unverified = should_withhold(
+        attributed.len(),
+        unattributed.len(),
+        plan.include_unverified,
+    );
+    if !plan.include_unverified && attributed.is_empty() && !unattributed.is_empty() {
+        stats.note(format!(
+            "arp named none of the {} address{} that answered, so no answer here can \
+             be attributed to a device; the arp phase is ineffective on this \
+             interface and the results are listed unverified",
+            unattributed.len(),
+            if unattributed.len() == 1 { "" } else { "es" }
+        ));
+    }
+
+    if drop_unverified {
+        stats.unverified_omitted = unattributed.len();
+        if plan.progress {
+            eprintln!(
+                "  note: omitting {} of the {} addresses that answered but were not \
+                 named by arp; pass --include-unverified to list them",
+                unattributed.len(),
+                hosts.len()
+            );
+        }
+    }
+    let hosts = if drop_unverified {
+        attributed.into_iter().cloned().collect::<Vec<Host>>()
+    } else {
+        hosts
+    };
 
     if plan.progress {
-        eprintln!(
-            "done: {} host{} in {}",
-            hosts.len(),
-            if hosts.len() == 1 { "" } else { "s" },
-            human(started.elapsed())
-        );
+        // Say what was withheld, so the shorter list is never mistaken for the
+        // whole sweep.
+        match stats.unverified_omitted {
+            0 => eprintln!(
+                "done: {} host{} in {}",
+                hosts.len(),
+                if hosts.len() == 1 { "" } else { "s" },
+                human(started.elapsed())
+            ),
+            n => eprintln!(
+                "done: {} host{} in {} ({} unattributed answer{} withheld)",
+                hosts.len(),
+                if hosts.len() == 1 { "" } else { "s" },
+                human(started.elapsed()),
+                n,
+                if n == 1 { "" } else { "s" }
+            ),
+        }
     }
 
     Ok(ScanReport {
@@ -373,6 +467,100 @@ fn warn_if_one_mac_answers_everything(plan: &ScanPlan, stats: &mut ScanStats, re
     stats.note(msg);
 }
 
+/// Which addresses the TCP phase should spend a connect on, and how many live
+/// hosts are already known dead enough to skip.
+///
+/// The cascade escalates to TCP for the addresses nothing answered for, which
+/// is what makes it cheap: no connect is spent on a host ARP already found. That
+/// is the right behaviour when the question is "who is here".
+///
+/// It is the wrong behaviour when the question is about a port, and a named port
+/// is that question. `-p 80,443` followed by no port column at all, because
+/// every address had already settled, is not an answer to "which ports are
+/// open". So with explicit ports, the hosts already known to be alive are
+/// included, and only the ones known to be dead are skipped. Nothing is spent on
+/// an address that has been shown to be empty.
+fn tcp_targets(
+    ports_explicit: bool,
+    all: &[Ipv4Addr],
+    settled: &HashSet<Ipv4Addr>,
+    live: &HashSet<Ipv4Addr>,
+) -> (Vec<Ipv4Addr>, usize) {
+    let residue: Vec<Ipv4Addr> = all
+        .iter()
+        .copied()
+        .filter(|ip| !settled.contains(ip))
+        .collect();
+    if !ports_explicit {
+        return (residue, 0);
+    }
+    let also_live: Vec<Ipv4Addr> = all
+        .iter()
+        .copied()
+        .filter(|ip| settled.contains(ip) && live.contains(ip))
+        .collect();
+    let n = also_live.len();
+    let mut targets = also_live;
+    targets.extend(residue);
+    (targets, n)
+}
+
+/// Whether anything in the sweep can say *which device* answered this address.
+///
+/// ARP is the only phase that learns a hardware address, so an address it never
+/// named is one whose liveness came from a later phase alone. That is not
+/// automatically suspicious: off-link, or with the ARP phase deliberately skipped,
+/// ICMP and TCP are the only evidence available and are as good as it gets.
+///
+/// So this asks a narrower question than "is it alive" -- it asks whether the
+/// sweep established a device, and it is only ever consulted where the ARP phase
+/// actually ran and could have said so.
+fn is_attributable(host: &Host) -> bool {
+    host.evidence.iter().any(|e| e.method == Method::Arp)
+}
+
+/// The targets for which an ARP exchange is meaningful.
+///
+/// ARP resolves names on a broadcast domain, so it applies to a directly-attached
+/// network and nowhere else. Loopback is excluded deliberately: a packet to
+/// `127.0.0.0/8` is delivered locally and never reaches a wire, so expecting a
+/// hardware address from it is expecting something the protocol cannot produce.
+/// Without a known interface there is no way to tell what is on-link, and
+/// guessing would produce false negatives, so that yields nothing rather than a
+/// guess.
+fn arp_eligible(plan: &ScanPlan, all: &[Ipv4Addr]) -> HashSet<Ipv4Addr> {
+    let Some(iface) = plan.interface.as_ref() else {
+        return HashSet::new();
+    };
+    all.iter()
+        .copied()
+        .filter(|ip| iface.contains(*ip) && !ip.is_loopback())
+        .collect()
+}
+
+/// Split the live hosts into those the sweep can attribute to a device and those
+/// it cannot.
+///
+/// A host counts as attributed when ARP named it, or when ARP could not have named
+/// it: off-link, on loopback, or with the phase deliberately skipped. Only an
+/// address inside `eligible` is held to the standard, because only there does
+/// answering ICMP without a hardware address amount to a contradiction.
+fn split_by_attribution<'a>(
+    hosts: &'a [Host],
+    eligible: &HashSet<Ipv4Addr>,
+) -> (Vec<&'a Host>, Vec<&'a Host>) {
+    let mut attributed = Vec::new();
+    let mut unattributed = Vec::new();
+    for h in hosts {
+        if !eligible.contains(&h.ip) || is_attributable(h) {
+            attributed.push(h);
+        } else {
+            unattributed.push(h);
+        }
+    }
+    (attributed, unattributed)
+}
+
 /// Hosts that answered a later phase but which ARP never named are not evidence
 /// of a host, and on a directly-attached link the combination is contradictory
 /// rather than merely thin.
@@ -389,17 +577,22 @@ fn warn_if_one_mac_answers_everything(plan: &ScanPlan, stats: &mut ScanStats, re
 /// periodic cycle, so its answers land in a handful of buckets. Reporting these
 /// separately from the named hosts is the honest outcome: they may be there, but
 /// nothing in the sweep has shown that they are.
-fn warn_about_unattributable_hosts(plan: &ScanPlan, stats: &mut ScanStats, hosts: &[Host]) {
+fn warn_about_unattributable_hosts(
+    plan: &ScanPlan,
+    stats: &mut ScanStats,
+    hosts: &[Host],
+    eligible: &HashSet<Ipv4Addr>,
+) {
     if hosts.is_empty() {
         return;
     }
-    let ghosts: Vec<&Host> = hosts.iter().filter(|h| h.mac.is_none()).collect();
+    let (attributed, ghosts) = split_by_attribution(hosts, eligible);
     // One or two could be a busy host that dropped an ARP reply. A large share of
     // the sweep is a different thing entirely, so only speak up at that scale.
     if ghosts.len() * 2 < hosts.len() {
         return;
     }
-    let named = hosts.len() - ghosts.len();
+    let named = attributed.len();
 
     // Round-trip times are the evidence, so report what they look like rather
     // than asserting a cause.
@@ -415,7 +608,7 @@ fn warn_about_unattributable_hosts(plan: &ScanPlan, stats: &mut ScanStats, hosts
     };
     let msg = format!(
         "{} of the {} live host{} cannot be attributed to a device: arp did not \
-         name them, so they are listed with a dash in the mac column. On a \
+         name them, so nothing here can say which device they are. On a \
          directly-attached link that combination is contradictory, because \
          answering icmp requires having resolved the target's hardware address \
          first. Something is answering echo on behalf of {} addresses it does \
@@ -444,6 +637,21 @@ fn warn_about_unattributable_hosts(plan: &ScanPlan, stats: &mut ScanStats, hosts
 /// ARP cannot be routed, so probing an off-subnet address is not merely
 /// useless, it is misleading: the request goes nowhere and the target looks
 /// dead. Those targets are counted and handed to the next method instead.
+/// Whether the unattributable answers should be withheld from the default list.
+///
+/// The `attributed == 0` guard is the one that matters most, and it exists because
+/// of how this went wrong the first time. On a virtual interface where the ARP
+/// phase cannot work, every answer is unattributable, and the rule taken naively
+/// deleted every host the sweep had found and reported an empty network. A phase
+/// that named nothing has failed; it has not proved the segment is empty, and the
+/// two must not be confused.
+fn should_withhold(attributed: usize, unattributed: usize, include_unverified: bool) -> bool {
+    !include_unverified
+        && unattributed > 0
+        && attributed > 0
+        && unattributed * 2 > attributed + unattributed
+}
+
 fn run_arp(
     plan: &ScanPlan,
     all: &[Ipv4Addr],
@@ -451,18 +659,23 @@ fn run_arp(
     stats: &mut ScanStats,
     settled: &mut HashSet<Ipv4Addr>,
 ) {
-    let on_link: Vec<Ipv4Addr> = match &plan.interface {
-        Some(iface) => all
-            .iter()
-            .copied()
-            .filter(|ip| iface.contains(*ip))
-            .collect(),
-        // Without a known interface there is no way to know what is on-link,
-        // and guessing would produce false negatives. Skip rather than lie.
-        None => {
-            stats.note("active arp skipped: no interface selected, so on-link targets are unknown");
+    let on_link: Vec<Ipv4Addr> = {
+        let eligible = arp_eligible(plan, all);
+        if eligible.is_empty() {
+            if plan.interface.is_none() {
+                stats.note(
+                    "active arp skipped: no interface selected, so on-link targets are unknown",
+                );
+            }
             return;
         }
+        let mut v: Vec<Ipv4Addr> = all
+            .iter()
+            .copied()
+            .filter(|ip| eligible.contains(ip))
+            .collect();
+        v.sort_unstable();
+        v
     };
     let off_link = all.len() - on_link.len();
     if off_link > 0 {
@@ -701,6 +914,8 @@ mod tests {
             interface: None,
             resolve_hostnames: false,
             include_cached: false,
+            ports_explicit: false,
+            include_unverified: false,
             progress: false,
         }
     }
@@ -818,6 +1033,12 @@ mod tests {
         Reply::new(ip, Outcome::Alive).with_mac(MacAddr::parse(mac).unwrap())
     }
 
+    /// Treat every host in the fixture as arp-eligible: these tests are about how
+    /// a verdict is drawn, not about which addresses are on-link.
+    fn all_eligible(hosts: &[Host]) -> HashSet<Ipv4Addr> {
+        hosts.iter().map(|h| h.ip).collect()
+    }
+
     /// A host table shaped like the real v0.1.3 scan: arp named a minority,
     /// and the rest are icmp answers with no hardware address.
     fn split_hosts(named: u8, ghosts: u8, rtt_ms: u64) -> Vec<Host> {
@@ -825,10 +1046,17 @@ mod tests {
         for i in 0..named {
             let mut h = Host::new(Ipv4Addr::new(10, 0, 0, i + 1));
             h.mac = Some(MacAddr([i, 1, 2, 3, 4, 5]));
+            h.evidence.push(Evidence {
+                method: Method::Arp,
+                outcome: Outcome::Alive,
+                rtt: None,
+                ttl: None,
+                port: None,
+            });
             hosts.push(h);
         }
         for i in 0..ghosts {
-            let mut h = Host::new(Ipv4Addr::new(10, 0, 1, i + 1));
+            let mut h = Host::new(Ipv4Addr::new(10, 0, 0, 100 + i));
             h.evidence.push(Evidence {
                 method: Method::Icmp,
                 outcome: Outcome::Alive,
@@ -850,7 +1078,7 @@ mod tests {
         let mut stats = ScanStats::default();
         let hosts = split_hosts(118, 136, 760);
 
-        warn_about_unattributable_hosts(&plan, &mut stats, &hosts);
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &all_eligible(&hosts));
         let note = stats
             .notes
             .iter()
@@ -876,7 +1104,7 @@ mod tests {
         let mut stats = ScanStats::default();
         let hosts = split_hosts(40, 2, 1);
 
-        warn_about_unattributable_hosts(&plan, &mut stats, &hosts);
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &all_eligible(&hosts));
         assert!(
             stats.notes.is_empty(),
             "expected silence for 2 of 42, got {:?}",
@@ -890,8 +1118,184 @@ mod tests {
         let mut stats = ScanStats::default();
         let hosts = split_hosts(254, 0, 0);
 
-        warn_about_unattributable_hosts(&plan, &mut stats, &hosts);
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &all_eligible(&hosts));
         assert!(stats.notes.is_empty(), "got {:?}", stats.notes);
+    }
+
+    #[test]
+    fn a_cached_zero_address_does_not_disguise_an_unattributed_host() {
+        // Windows keeps rows for entries it has not finished resolving, and
+        // those carry six zero bytes. If that counted as a hardware address, the
+        // hosts it describes would look named and the warning would stay quiet
+        // on exactly the sweep that needs it.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let mut hosts = split_hosts(4, 6, 991);
+        for h in hosts.iter_mut().skip(4) {
+            h.mac = Some(MacAddr([0; 6]));
+        }
+
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts, &all_eligible(&hosts));
+        assert!(
+            stats
+                .notes
+                .iter()
+                .any(|n| n.contains("cannot be attributed")),
+            "a zero hardware address must not count as a name, got {:?}",
+            stats.notes
+        );
+    }
+
+    #[test]
+    fn zero_and_broadcast_are_not_hardware_addresses() {
+        assert!(MacAddr([0; 6]).is_unspecified());
+        assert!(!MacAddr([0, 0, 0, 0, 0, 1]).is_unspecified());
+        assert!(MacAddr::BROADCAST.is_broadcast());
+        assert!(!MacAddr([0; 6]).is_broadcast());
+    }
+
+    #[test]
+    fn a_target_arp_could_never_name_is_not_held_to_it() {
+        // Loopback has no broadcast domain and no wire, so no hardware address can
+        // exist for it. Demanding one is demanding the impossible, and it made
+        // `ipscan 127.0.0.1` report nothing at all.
+        let hosts = split_hosts(0, 1, 1);
+        let eligible = arp_eligible(
+            &plan_with_interface("lo", "127.0.0.0/8"),
+            &[Ipv4Addr::LOCALHOST],
+        );
+        let (attributed, unattributed) = split_by_attribution(&hosts, &eligible);
+        assert!(
+            eligible.is_empty(),
+            "loopback must not be arp-eligible, got {eligible:?}"
+        );
+        assert_eq!(attributed.len(), 1, "the host must still be reported");
+        assert!(unattributed.is_empty());
+    }
+
+    #[test]
+    fn an_off_link_target_is_not_held_to_arp_either() {
+        let hosts = split_hosts(0, 4, 1);
+        // 10.9.9.0/24 is a different network from the interface's 10.0.0.0/24.
+        let eligible = arp_eligible(
+            &plan_with_interface("eth0", "10.0.0.0/24"),
+            &[Ipv4Addr::new(10, 9, 9, 1)],
+        );
+        assert!(eligible.is_empty());
+        let (attributed, unattributed) = split_by_attribution(&hosts, &eligible);
+        assert_eq!(attributed.len(), 4, "icmp alone is enough off-link");
+        assert!(unattributed.is_empty());
+    }
+
+    #[test]
+    fn an_on_link_target_is_held_to_arp() {
+        let hosts = split_hosts(0, 4, 1);
+        let eligible = arp_eligible(
+            &plan_with_interface("eth0", "10.0.0.0/24"),
+            &[Ipv4Addr::new(10, 0, 0, 100)],
+        );
+        assert_eq!(eligible.len(), 1, "on-link and not loopback is eligible");
+        let (_, unattributed) = split_by_attribution(&hosts, &eligible);
+        assert_eq!(unattributed.len(), 1, "the on-link one is unattributable");
+    }
+
+    fn parse_cidr_for_test(cidr: &str) -> (Ipv4Addr, u8) {
+        let (addr, len) = cidr.split_once('/').expect("test cidr needs a prefix");
+        (
+            addr.parse().expect("test cidr address"),
+            len.parse().expect("test cidr prefix"),
+        )
+    }
+
+    /// A plan whose interface covers `cidr`, so on-link tests have something real
+    /// to be on-link relative to.
+    fn plan_with_interface(name: &str, cidr: &str) -> ScanPlan {
+        let (addr, prefix) = parse_cidr_for_test(cidr);
+        let mask = u32::MAX << (32 - prefix);
+        let mut plan = plan_for("10.0.0.0/24");
+        plan.interface = Some(Interface {
+            name: name.to_string(),
+            addr,
+            netmask: Ipv4Addr::from(mask),
+            prefix,
+            broadcast: Some(Ipv4Addr::from(u32::from(addr) | !mask)),
+            loopback: name == "lo",
+        });
+        plan
+    }
+
+    #[test]
+    fn a_broken_arp_phase_never_empties_the_sweep() {
+        // The real failure this rule caused: a virtual interface where arp cannot
+        // work, so every answer is unattributable and the naive rule reported zero
+        // hosts for a working scan. A phase that named nothing has failed, not
+        // proved the segment empty.
+        assert!(
+            !should_withhold(0, 20, false),
+            "an ineffective arp phase must not delete every host"
+        );
+    }
+
+    #[test]
+    fn a_real_crowd_of_unattributable_answers_is_withheld() {
+        // The shape of the Windows scan: 118 named, 136 not.
+        assert!(should_withhold(118, 136, false));
+        assert!(
+            !should_withhold(136, 118, false),
+            "a minority is not a crowd"
+        );
+    }
+
+    #[test]
+    fn the_flag_always_wins() {
+        assert!(!should_withhold(118, 136, true));
+        assert!(!should_withhold(0, 20, true));
+    }
+
+    #[test]
+    fn nothing_to_withhold_is_not_a_withholding() {
+        assert!(!should_withhold(20, 0, false));
+        assert!(!should_withhold(0, 0, false));
+    }
+
+    #[test]
+    fn named_ports_reach_hosts_arp_already_found() {
+        // The case that prompted this: `-p 80,443` and no port column, because
+        // every address had already settled on an earlier phase.
+        let all: Vec<Ipv4Addr> = (1..=6u8).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+        let settled: HashSet<Ipv4Addr> = all[..4].iter().copied().collect();
+        let live = settled.clone();
+
+        let (targets, known_live) = tcp_targets(true, &all, &settled, &live);
+        assert_eq!(targets.len(), 6, "every address gets its ports probed");
+        assert_eq!(known_live, 4, "four were already alive");
+        assert!(targets.contains(&Ipv4Addr::new(10, 0, 0, 5)));
+    }
+
+    #[test]
+    fn default_ports_still_spend_nothing_on_confirmed_hosts() {
+        // The cascade's whole value: no connect on a host arp already found.
+        let all: Vec<Ipv4Addr> = (1..=6u8).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+        let settled: HashSet<Ipv4Addr> = all[..4].iter().copied().collect();
+        let live = settled.clone();
+
+        let (targets, known_live) = tcp_targets(false, &all, &settled, &live);
+        assert_eq!(targets.len(), 2, "only the residue");
+        assert_eq!(known_live, 0);
+        assert!(!targets.contains(&Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn named_ports_never_probe_an_address_shown_to_be_dead() {
+        // Withdrawing from a settled address is what the cascade does when it has
+        // no answer. Naming ports must not resurrect one.
+        let all: Vec<Ipv4Addr> = (1..=3u8).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
+        let settled: HashSet<Ipv4Addr> = [Ipv4Addr::new(10, 0, 0, 1)].into_iter().collect();
+        let live: HashSet<Ipv4Addr> = HashSet::new();
+
+        let (targets, _) = tcp_targets(true, &all, &settled, &live);
+        assert_eq!(targets.len(), 2);
+        assert!(!targets.contains(&Ipv4Addr::new(10, 0, 0, 1)));
     }
 
     #[test]

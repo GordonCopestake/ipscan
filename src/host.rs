@@ -144,6 +144,15 @@ impl MacAddr {
     pub fn is_broadcast(&self) -> bool {
         self.0 == [0xff; 6]
     }
+
+    /// An all-zero address is not a device. Windows keeps rows in its neighbour
+    /// table for entries it has not finished resolving, and those carry six zero
+    /// bytes where a hardware address would go. Treating one as a real address
+    /// puts `00:00:00:00:00:00` in a table of hardware addresses, which reads as
+    /// an answer rather than as the absence of one.
+    pub fn is_unspecified(&self) -> bool {
+        self.0 == [0; 6]
+    }
 }
 
 impl fmt::Display for MacAddr {
