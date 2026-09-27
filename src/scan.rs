@@ -174,6 +174,24 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         );
     }
     let seed: HashSet<Ipv4Addr> = cached.iter().map(|n| n.ip).collect();
+    // Addresses that already have a usable MAC in the neighbour cache need no
+    // active ARP probe -- the cache entry is fresher than any reply we'd get
+    // from a new request, and the late attribution pass will copy it in.
+    let cached_mac: HashSet<Ipv4Addr> = cached
+        .iter()
+        .filter(|n| !n.mac.is_unspecified() && !n.mac.is_broadcast())
+        .map(|n| n.ip)
+        .collect();
+
+    // Record the initial cache MACs into the table. A direct ARP reply (which
+    // comes later) will overwrite via `record_mac`, but if no reply arrives
+    // the cache MAC remains as attribution. This is the primary MAC source on
+    // platforms where the active sweep cannot run or is skipped.
+    for n in &cached {
+        if !n.mac.is_unspecified() && !n.mac.is_broadcast() {
+            table.record_mac(n.ip, n.mac);
+        }
+    }
 
     // Prioritise addresses the kernel resolved recently: if it answered for them
     // a moment ago it probably will again, and this is most of the difference
@@ -188,9 +206,15 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     let mut settled: HashSet<Ipv4Addr> = HashSet::new();
 
     // ------------------------------------------------------------- ARP ----
-    let mut arp_actually_ran = false;
     if matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto) {
-        arp_actually_ran = run_arp(plan, &all, &mut table, &mut stats, &mut settled);
+        run_arp(
+            plan,
+            &all,
+            &mut table,
+            &mut stats,
+            &mut settled,
+            &cached_mac,
+        );
     }
 
     // ------------------------------------------------------------ ICMP ----
@@ -294,7 +318,8 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // probe. Off-link and loopback are exempt: no ARP exchange could ever name
     // them, and with the phase deliberately skipped the cache is the only source
     // available.
-    let eligible = if arp_actually_ran {
+    let arp_could_run = matches!(plan.method, MethodChoice::Arp | MethodChoice::Auto);
+    let eligible = if arp_could_run {
         arp_eligible(plan, &all)
     } else {
         HashSet::new()
@@ -730,26 +755,24 @@ fn run_arp(
     table: &mut HostTable,
     stats: &mut ScanStats,
     settled: &mut HashSet<Ipv4Addr>,
+    cached_mac: &HashSet<Ipv4Addr>,
 ) -> bool {
-    let on_link: Vec<Ipv4Addr> = {
-        let eligible = arp_eligible(plan, all);
-        if eligible.is_empty() {
-            if plan.interface.is_none() {
-                stats.note(
-                    "active arp skipped: no interface selected, so on-link targets are unknown",
-                );
-            }
-            return false;
+    let eligible = arp_eligible(plan, all);
+    if eligible.is_empty() {
+        if plan.interface.is_none() {
+            stats.note("active arp skipped: no interface selected, so on-link targets are unknown");
         }
-        let mut v: Vec<Ipv4Addr> = all
-            .iter()
-            .copied()
-            .filter(|ip| eligible.contains(ip))
-            .collect();
-        v.sort_unstable();
-        v
-    };
-    let off_link = all.len() - on_link.len();
+        return false;
+    }
+    // Skip targets that already have a valid MAC in the neighbour cache.
+    // This avoids redundant SendARP calls whose internal timeout dominates
+    // the scan time on Windows.
+    let on_link: Vec<Ipv4Addr> = all
+        .iter()
+        .copied()
+        .filter(|ip| eligible.contains(ip) && !cached_mac.contains(ip))
+        .collect();
+    let off_link = all.len() - eligible.len();
     if off_link > 0 {
         stats.arp_unreachable = off_link;
     }

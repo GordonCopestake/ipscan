@@ -61,7 +61,7 @@ pub struct Cli {
     pub ports: Option<Vec<u16>>,
 
     /// Milliseconds to wait for any single probe.
-    #[arg(long, value_name = "MS", default_value_t = 1000)]
+    #[arg(long, value_name = "MS", default_value_t = 500)]
     pub timeout: u64,
 
     /// Extra attempts for targets that do not answer the first probe.
@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(c.method, MethodChoice::Auto);
         assert_eq!(c.format, Format::Table);
         assert_eq!(c.retries, 1);
-        assert_eq!(c.timeout, 1000);
+        assert_eq!(c.timeout, 500);
         assert_eq!(c.ports, None);
         assert!(c.targets.is_empty());
     }

@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.1.8-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.1.8-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.1.9-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.1.9-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.1.8-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.1.9-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.1.8
+ipscan 0.1.9
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
@@ -343,6 +343,20 @@ ipscan 192.168.1.0/24               # probes ports only where nothing else answe
 
 Addresses already shown to be dead are still skipped either way. Naming ports
 never turns into spending connects on addresses that have proved empty.
+
+### ARP cache reuse avoids redundant probes
+
+The neighbour table is read at the start of every scan. If it already contains a
+valid hardware address for a target, the active ARP sweep skips that target --
+the cache entry is fresher than any reply a new request would get, and the late
+attribution pass will copy it in. On Windows where `SendARP` has a fixed internal
+timeout, this can cut the ARP phase from ~13 s to ~1 s on a /24.
+
+### Faster default timeout
+
+The default probe timeout is now 500 ms (was 1000 ms). With the default one
+retry this halves the worst-case time for non-responders from 2 s to 1 s.
+Restore the old behaviour with `--timeout 1000`.
 
 ### `-p` is a question about ports, not a fallback
 

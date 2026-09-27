@@ -56,7 +56,7 @@ impl Default for ProbeConfig {
 /// `--concurrency` literally on these paths costs far more than it buys and is
 /// enough to make a machine crawl. These calls are I/O-blocked, so a few dozen
 /// workers already keep every timeout window occupied.
-pub const MAX_BLOCKING_WORKERS: usize = 64;
+pub const MAX_BLOCKING_WORKERS: usize = 128;
 
 /// How many threads to use for a blocking, per-target probe of `total`
 /// targets: enough to keep the waits overlapped, never more than there are
