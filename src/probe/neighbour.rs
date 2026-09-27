@@ -208,6 +208,7 @@ mod platform {
     pub fn read() -> Result<Vec<super::Neighbour>> {
         const NO_ERROR: u32 = 0;
         const ERROR_BUFFER_OVERFLOW: u32 = 111;
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
         const ERROR_NO_DATA: u32 = 232;
 
         let mut size: u32 = 0;
@@ -220,8 +221,15 @@ mod platform {
         if rc == ERROR_NO_DATA || size == 0 {
             return Ok(Vec::new());
         }
-        if rc != ERROR_BUFFER_OVERFLOW && rc != NO_ERROR {
+        // The two codes are aliases in practice. Documented as
+        // ERROR_BUFFER_OVERFLOW, but the size query with a null buffer comes
+        // back as ERROR_INSUFFICIENT_BUFFER, and taking only the documented one
+        // made a working cache unreadable on the machine that reported it.
+        if rc != ERROR_BUFFER_OVERFLOW && rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR {
             anyhow::bail!("GetIpNetTable could not report the table size: error {rc}");
+        }
+        if size == 0 {
+            return Ok(Vec::new());
         }
 
         // The API is free to want more space on the second call than it reported

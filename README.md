@@ -253,6 +253,34 @@ probing 254 on-link addresses with arp...
 Treat such addresses as *routed*, not *present*. If you need a trustworthy host
 count on a proxied segment, ARP cannot give you one.
 
+### So can a device that answers ping for others
+
+Yes, and it is harder to catch than proxy-ARP, because it forges the source
+address correctly. Something answering echo for a range it only routes produces
+a perfect `IP_SUCCESS` from the address you asked, so there is nothing in the
+reply to distrust.
+
+The contradiction is one level up. Answering ICMP on a directly-attached link
+requires having resolved the target's hardware address first, so a host that
+answers echo on your own subnet has necessarily been resolved. If ARP did not
+name it and ICMP claims it anyway, one of those is wrong. The round-trip times
+settle which: real hosts on one link answer in well under a millisecond and
+scatter, while one responder has a single periodic cycle, so its answers land in
+a handful of buckets. A sweep where most live hosts have a dash in the MAC
+column and their RTTs span a suspiciously narrow range is that, and `ipscan`
+says so:
+
+```
+warning: 136 of the 254 live hosts cannot be attributed to a device: arp did not
+name them ... Their round-trip times span 758ms to 1002ms, which is the signature
+of a single periodic responder rather than 136 separate machines. Only the 118
+hosts arp named should be counted as a host census; treat the rest as unverified.
+```
+
+The warning is deliberately quiet about a handful of unnamed hosts. A busy
+machine that dropped one ARP reply is ordinary, and a warning that fires on
+ordinary noise teaches you to ignore the warning that matters.
+
 ## Licence
 
 MIT or Apache-2.0, at your option.

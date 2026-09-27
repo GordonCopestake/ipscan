@@ -309,21 +309,7 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
     hosts.sort_by_key(|h| u32::from(h.ip));
 
-    // ARP is the only phase that can name a host, so a later phase settling an
-    // address ARP never claimed leaves a row with a dash where the hardware
-    // address should be. Worth one line, because a dash there reads as "no device
-    // answered" when the likelier truth is "arp was answered for some of these
-    // and not the others", which is a different problem with a different fix.
-    let nameless = hosts.iter().filter(|h| h.mac.is_none()).count();
-    if plan.progress && nameless > 0 && nameless < hosts.len() {
-        eprintln!(
-            "  note: {nameless} of the {} live host{} were settled without a hardware \
-             address, meaning arp did not answer for them; they are listed with a \
-             dash in the mac column",
-            hosts.len(),
-            if hosts.len() == 1 { "" } else { "s" }
-        );
-    }
+    warn_about_unattributable_hosts(plan, &mut stats, &hosts);
 
     if plan.progress {
         eprintln!(
@@ -380,6 +366,72 @@ fn warn_if_one_mac_answers_everything(plan: &ScanPlan, stats: &mut ScanStats, re
          which is proxy-arp: one device answering for a range it routes rather \
          than {count} separate hosts",
         replies.len()
+    );
+    if plan.progress {
+        eprintln!("  warning: {msg}");
+    }
+    stats.note(msg);
+}
+
+/// Hosts that answered a later phase but which ARP never named are not evidence
+/// of a host, and on a directly-attached link the combination is contradictory
+/// rather than merely thin.
+///
+/// Sending the echo requires resolving the target's hardware address first. So a
+/// host that answers ICMP on our own subnet has necessarily been resolved, and
+/// either the ARP phase should have named it or the reply did not come from the
+/// address we asked. Devices that answer echo on behalf of a range they merely
+/// route do exist, and they forge the source address correctly enough to pass a
+/// reply-source check, so this cannot be settled by looking harder at the reply.
+///
+/// The tell that settles it is the round-trip time. Real hosts on one link
+/// answer in well under a millisecond and scatter; a single responder has one
+/// periodic cycle, so its answers land in a handful of buckets. Reporting these
+/// separately from the named hosts is the honest outcome: they may be there, but
+/// nothing in the sweep has shown that they are.
+fn warn_about_unattributable_hosts(plan: &ScanPlan, stats: &mut ScanStats, hosts: &[Host]) {
+    if hosts.is_empty() {
+        return;
+    }
+    let ghosts: Vec<&Host> = hosts.iter().filter(|h| h.mac.is_none()).collect();
+    // One or two could be a busy host that dropped an ARP reply. A large share of
+    // the sweep is a different thing entirely, so only speak up at that scale.
+    if ghosts.len() * 2 < hosts.len() {
+        return;
+    }
+    let named = hosts.len() - ghosts.len();
+
+    // Round-trip times are the evidence, so report what they look like rather
+    // than asserting a cause.
+    let mut rtts: Vec<u128> = ghosts
+        .iter()
+        .filter_map(|h| h.evidence.iter().find_map(|e| e.rtt))
+        .map(|d| d.as_millis())
+        .collect();
+    rtts.sort_unstable();
+    let spread = match (rtts.first(), rtts.last()) {
+        (Some(lo), Some(hi)) => format!("{lo:.1}ms to {hi:.1}ms"),
+        _ => "unavailable".to_string(),
+    };
+    let msg = format!(
+        "{} of the {} live host{} cannot be attributed to a device: arp did not \
+         name them, so they are listed with a dash in the mac column. On a \
+         directly-attached link that combination is contradictory, because \
+         answering icmp requires having resolved the target's hardware address \
+         first. Something is answering echo on behalf of {} addresses it does \
+         not own, or arp lost {} replies. Their round-trip times span {}, \
+         which is the signature of a single periodic responder rather than {} \
+         separate machines. Only the {} host{} arp named should be counted as \
+         a host census; treat the rest as unverified.",
+        ghosts.len(),
+        hosts.len(),
+        if hosts.len() == 1 { "" } else { "s" },
+        ghosts.len(),
+        ghosts.len(),
+        spread,
+        ghosts.len(),
+        named,
+        if named == 1 { "" } else { "s" },
     );
     if plan.progress {
         eprintln!("  warning: {msg}");
@@ -634,7 +686,7 @@ impl Ticker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::MacAddr;
+    use crate::host::{Evidence, MacAddr};
 
     fn plan_for(spec: &str) -> ScanPlan {
         ScanPlan {
@@ -764,6 +816,82 @@ mod tests {
 
     fn arp_reply(ip: Ipv4Addr, mac: &str) -> Reply {
         Reply::new(ip, Outcome::Alive).with_mac(MacAddr::parse(mac).unwrap())
+    }
+
+    /// A host table shaped like the real v0.1.3 scan: arp named a minority,
+    /// and the rest are icmp answers with no hardware address.
+    fn split_hosts(named: u8, ghosts: u8, rtt_ms: u64) -> Vec<Host> {
+        let mut hosts = Vec::new();
+        for i in 0..named {
+            let mut h = Host::new(Ipv4Addr::new(10, 0, 0, i + 1));
+            h.mac = Some(MacAddr([i, 1, 2, 3, 4, 5]));
+            hosts.push(h);
+        }
+        for i in 0..ghosts {
+            let mut h = Host::new(Ipv4Addr::new(10, 0, 1, i + 1));
+            h.evidence.push(Evidence {
+                method: Method::Icmp,
+                outcome: Outcome::Alive,
+                rtt: Some(Duration::from_millis(rtt_ms)),
+                ttl: None,
+                port: None,
+            });
+            hosts.push(h);
+        }
+        hosts
+    }
+
+    #[test]
+    fn a_crowd_of_unattributable_hosts_is_called_out() {
+        // The shape of a real scan: 118 hosts arp named, 136 that only icmp
+        // claimed. Reporting 254 live hosts is the failure that matters, because
+        // the 136 cannot be attributed to any device.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let hosts = split_hosts(118, 136, 760);
+
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts);
+        let note = stats
+            .notes
+            .iter()
+            .find(|n| n.contains("cannot be attributed"))
+            .unwrap_or_else(|| panic!("expected a warning, got {:?}", stats.notes));
+        assert!(note.contains("136"), "should count the ghosts: {note}");
+        assert!(
+            note.contains("118"),
+            "should say how many were named: {note}"
+        );
+        assert!(
+            note.contains("760ms to 760ms"),
+            "should report the round-trip spread: {note}"
+        );
+    }
+
+    #[test]
+    fn a_few_unnamed_hosts_do_not_raise_a_crowd_warning() {
+        // Two hosts that dropped an ARP reply is ordinary. It is not evidence of
+        // a responder, and warning about it would train people to ignore the
+        // warning that does matter.
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let hosts = split_hosts(40, 2, 1);
+
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts);
+        assert!(
+            stats.notes.is_empty(),
+            "expected silence for 2 of 42, got {:?}",
+            stats.notes
+        );
+    }
+
+    #[test]
+    fn a_fully_named_sweep_is_silent() {
+        let plan = plan_for("10.0.0.0/24");
+        let mut stats = ScanStats::default();
+        let hosts = split_hosts(254, 0, 0);
+
+        warn_about_unattributable_hosts(&plan, &mut stats, &hosts);
+        assert!(stats.notes.is_empty(), "got {:?}", stats.notes);
     }
 
     #[test]
