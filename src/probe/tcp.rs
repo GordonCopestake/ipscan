@@ -322,6 +322,28 @@ mod tests {
         p
     }
 
+    /// A port confirmed to be refusing connections.
+    ///
+    /// [`dead_port`] on its own is not good enough: the port is released the
+    /// moment the listener drops, and a test running in parallel can claim it
+    /// before the prober dials it, which turns the expected refusal into an
+    /// accept. So dial it first and only keep the port if a refusal actually
+    /// comes back.
+    fn confirmed_dead_port() -> u16 {
+        for _ in 0..64 {
+            let port = dead_port();
+            let Ok(addr) = format!("127.0.0.1:{port}").parse::<SocketAddr>() else {
+                continue;
+            };
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return port,
+                // Something claimed the port, so it was not a dead port after all.
+                _ => continue,
+            }
+        }
+        panic!("could not find a port that refuses connections");
+    }
+
     #[test]
     fn finds_a_listening_port() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -345,7 +367,7 @@ mod tests {
     #[test]
     fn a_reset_is_reported_as_filtered_not_silent() {
         // This is the case that matters most: a host that is up but refuses us.
-        let port = dead_port();
+        let port = confirmed_dead_port();
         let mut p = prober_on(&[port]);
         let replies = p.probe_round(&[Ipv4Addr::LOCALHOST]).unwrap();
 
@@ -384,17 +406,23 @@ mod tests {
             let _ = listener.accept();
         });
 
-        let mut p = prober_on(&[open, dead_port(), dead_port()]);
+        let mut p = prober_on(&[open, confirmed_dead_port(), confirmed_dead_port()]);
         let replies = p.probe_round(&[Ipv4Addr::LOCALHOST]).unwrap();
         assert_eq!(replies.len(), 1, "targets must not be reported twice");
     }
 
+    /// More targets than the concurrency limit, to exercise the refill path.
+    ///
+    /// Only Linux treats the whole of `127.0.0.0/8` as local. macOS and Windows
+    /// route just `127.0.0.1`, so the remaining addresses are genuinely absent
+    /// there and correctly produce no evidence at all, which makes an assertion
+    /// of 64 replies untrue on those platforms rather than the prober wrong.
+    #[cfg(target_os = "linux")]
     #[test]
     fn many_targets_are_handled_with_a_small_socket_budget() {
-        // More targets than the concurrency limit, to exercise the refill path.
-        // All of 127.0.0.0/8 is loopback, so every address is genuinely present:
-        // the one with the listener accepts, and the rest refuse. That makes this
-        // a test of refill, deduplication, and reset handling at the same time.
+        // Every address is genuinely present: the one with the listener accepts,
+        // and the rest refuse. That makes this a test of refill, deduplication,
+        // and reset handling at the same time.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -402,7 +430,7 @@ mod tests {
         });
 
         let targets: Vec<Ipv4Addr> = (1..=64).map(|i| Ipv4Addr::new(127, 0, 0, i)).collect();
-        let mut p = prober_on(&[port, dead_port()]);
+        let mut p = prober_on(&[port, confirmed_dead_port()]);
         let replies = p.probe_round(&targets).unwrap();
 
         assert_eq!(
@@ -423,5 +451,27 @@ mod tests {
                 "a refusal still proves the host exists: {r:?}"
             );
         }
+    }
+
+    /// Refilling the queue past the concurrency ceiling must not invent evidence.
+    ///
+    /// This is the portable half of the test above: it needs more targets than
+    /// the socket budget but no assumption that any of them is reachable, so it
+    /// holds on every platform.
+    #[test]
+    fn refill_does_not_invent_evidence_for_unreachable_targets() {
+        let targets: Vec<Ipv4Addr> = (1..=64).map(|i| Ipv4Addr::new(192, 0, 2, i)).collect();
+        let mut p = TcpProber::new(&ProbeConfig {
+            ports: vec![confirmed_dead_port()],
+            // Kept short so a whole batch of timeouts does not dominate the run.
+            timeout: Duration::from_millis(400),
+            concurrency: 8,
+            ..ProbeConfig::default()
+        });
+        let replies = p.probe_round(&targets).unwrap();
+        assert!(
+            replies.is_empty(),
+            "unreachable targets must stay silent, got {replies:?}"
+        );
     }
 }
