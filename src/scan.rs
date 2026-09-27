@@ -24,8 +24,10 @@
 //! populates the table. That makes the post-sweep read a side effect of our own
 //! probe rather than a guess, and it needs no privileges.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -38,6 +40,16 @@ use crate::probe::neighbour;
 use crate::probe::tcp::TcpProber;
 use crate::probe::{ProbeConfig, Reply};
 use crate::target::TargetSet;
+
+/// How often a blocked phase says that it is still going.
+const TICK: Duration = Duration::from_secs(2);
+
+/// Threads used to overlap reverse lookups. Lookups block in the system
+/// resolver, so the count is a parallelism choice, not a formatting one.
+const DNS_WORKERS: usize = 32;
+
+/// How long a single reverse lookup is given before the set is called done.
+const DNS_PER_LOOKUP: Duration = Duration::from_millis(750);
 
 /// Which probes to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -119,11 +131,20 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // Addresses, in the order they will be probed. Read once for MACs and for
     // a better probe order, then re-read after the sweep for the real mapping.
     let mut all: Vec<Ipv4Addr> = plan.targets.iter().collect();
-    let seed: HashSet<Ipv4Addr> = neighbour::read_table()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|n| n.ip)
-        .collect();
+    if plan.progress {
+        eprintln!("reading the neighbour cache...");
+    }
+    let cache_started = Instant::now();
+    let cached: Vec<crate::probe::neighbour::Neighbour> =
+        neighbour::read_table().unwrap_or_default();
+    if plan.progress {
+        eprintln!(
+            "  neighbour cache: {} entries in {}",
+            cached.len(),
+            human(cache_started.elapsed())
+        );
+    }
+    let seed: HashSet<Ipv4Addr> = cached.iter().map(|n| n.ip).collect();
 
     // Prioritise addresses the kernel resolved recently: if it answered for them
     // a moment ago it probably will again, and this is most of the difference
@@ -158,10 +179,27 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
                     if plan.progress {
                         eprintln!("  via {}", prober.socket_kind().as_str());
                     }
+                    let before = settled.len();
+                    let ticker = Ticker::start("icmp");
+                    let phase_started = Instant::now();
                     stats.icmp_probes +=
                         run_icmp_rounds(&mut prober, &pending, plan, &mut table, &mut settled);
+                    ticker.stop();
+                    if plan.progress {
+                        eprintln!(
+                            "  icmp: {} answered of {} in {}",
+                            settled.len().saturating_sub(before),
+                            pending.len(),
+                            human(phase_started.elapsed())
+                        );
+                    }
                 }
-                Err(e) => stats.note(format!("icmp unavailable, falling back to tcp: {e:#}")),
+                Err(e) => {
+                    if plan.progress {
+                        eprintln!("  icmp unavailable: {e:#}");
+                    }
+                    stats.note(format!("icmp unavailable, falling back to tcp: {e:#}"));
+                }
             }
         }
     }
@@ -184,13 +222,26 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
                     residue.len()
                 );
             }
+            let before = settled.len();
+            let attempts = residue.len() * TcpProber::new(&plan.config).ports().len();
+            let ticker = Ticker::start("tcp");
+            let phase_started = Instant::now();
             let mut prober = TcpProber::new(&plan.config);
-            stats.tcp_connections += (residue.len() * prober.ports().len()) as u64;
+            stats.tcp_connections += attempts as u64;
             for reply in prober.probe_round(&residue)? {
                 record(&mut table, &mut settled, reply, Method::Tcp);
             }
             for f in prober.failures() {
                 stats.note(format!("tcp connect could not be attempted: {f}"));
+            }
+            ticker.stop();
+            if plan.progress {
+                eprintln!(
+                    "  tcp: {} answered of {} connects in {}",
+                    settled.len().saturating_sub(before),
+                    attempts,
+                    human(phase_started.elapsed())
+                );
             }
         }
     }
@@ -206,8 +257,8 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         }
         table.record_mac(n.ip, n.mac);
     }
-    if macs_added > 0 && plan.progress {
-        eprintln!("resolved {macs_added} hardware addresses from the neighbour table");
+    if plan.progress && macs_added > 0 {
+        eprintln!("resolved {macs_added} hardware addresses from the neighbour cache");
     }
 
     // Addresses the cache knows but no probe confirmed.
@@ -225,15 +276,37 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     // ------------------------------------------------------- hostnames ----
     if plan.resolve_hostnames {
         let alive: Vec<Ipv4Addr> = table.alive().iter().map(|h| h.ip).collect();
-        for ip in alive {
-            if let Some(name) = reverse_dns(ip) {
-                table.record_hostname(ip, name);
-            }
+        if plan.progress && !alive.is_empty() {
+            eprintln!("resolving hostnames for {} addresses...", alive.len());
+        }
+        let ticker = Ticker::start("dns");
+        let phase_started = Instant::now();
+        let names = resolve_all(&alive);
+        for (ip, name) in &names {
+            table.record_hostname(*ip, name.clone());
+        }
+        ticker.stop();
+        if plan.progress && !alive.is_empty() {
+            eprintln!(
+                "  dns: {} of {} resolved in {}",
+                names.len(),
+                alive.len(),
+                human(phase_started.elapsed())
+            );
         }
     }
 
     let mut hosts = table.alive().into_iter().cloned().collect::<Vec<Host>>();
     hosts.sort_by_key(|h| u32::from(h.ip));
+
+    if plan.progress {
+        eprintln!(
+            "done: {} host{} in {}",
+            hosts.len(),
+            if hosts.len() == 1 { "" } else { "s" },
+            human(started.elapsed())
+        );
+    }
 
     Ok(ScanReport {
         hosts,
@@ -289,16 +362,31 @@ fn run_arp(
             if plan.progress {
                 eprintln!("probing {} on-link addresses with arp...", on_link.len());
             }
-            match prober.probe_round(&on_link) {
+            let ticker = Ticker::start("arp");
+            let phase_started = Instant::now();
+            let alive = match prober.probe_round(&on_link) {
                 Ok(replies) => {
+                    let n = replies.len();
                     for reply in replies {
                         if let Some(mac) = reply.mac {
                             table.record_mac(reply.ip, mac);
                         }
                         record(table, settled, reply, Method::Arp);
                     }
+                    n
                 }
-                Err(e) => stats.note(format!("active arp failed: {e:#}")),
+                Err(e) => {
+                    stats.note(format!("active arp failed: {e:#}"));
+                    0
+                }
+            };
+            ticker.stop();
+            if plan.progress {
+                eprintln!(
+                    "  arp: {alive} alive of {} in {}",
+                    on_link.len(),
+                    human(phase_started.elapsed())
+                );
             }
         }
         Err(e) => stats.note(format!("active arp unavailable: {e:#}")),
@@ -350,18 +438,126 @@ fn record(table: &mut HostTable, settled: &mut HashSet<Ipv4Addr>, reply: Reply, 
     }
 }
 
-/// Reverse DNS, with a hard timeout so one black-holed resolver cannot hang the
-/// whole scan. Neither `getnameinfo` nor `GetAddrInfoW` has a timeout knob, so
-/// each lookup is isolated on a thread that we simply stop waiting for.
-fn reverse_dns(ip: Ipv4Addr) -> Option<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        if let Some(name) = crate::dns::lookup(ip) {
-            let _ = tx.send(name);
-        }
-    });
+/// Reverse-resolve a set of addresses, concurrently.
+///
+/// Neither `getnameinfo` nor `GetAddrInfoExW` has a timeout knob, and a
+/// black-holed resolver can sit in a call for the operating system's full
+/// several-seconds DNS timeout. Two things follow. Each lookup has to be
+/// isolated on a thread the caller is willing to walk away from, and the
+/// abandoned threads must be *bounded* — one per address turned a large scan
+/// into a few hundred threads stuck in the resolver, which is its own kind of
+/// hang. So the set is drained by a small pool, and the pool is given one
+/// overall budget sized by how many rounds of it the set needs.
+fn resolve_all(ips: &[Ipv4Addr]) -> HashMap<Ipv4Addr, String> {
+    let mut found: HashMap<Ipv4Addr, String> = HashMap::new();
+    if ips.is_empty() {
+        return found;
+    }
 
-    rx.recv_timeout(Duration::from_millis(750)).ok()
+    let workers = crate::probe::blocking_workers(ips.len(), DNS_WORKERS);
+    let queue = Arc::new(Mutex::new(ips.to_vec()));
+    let (tx, rx) = mpsc::channel::<(Ipv4Addr, String)>();
+
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        // Detached on purpose: a resolver call cannot be cancelled, so the main
+        // thread gives up on it rather than joining it. The pool bounds how
+        // many such calls can be outstanding.
+        std::thread::spawn(move || {
+            loop {
+                let next = queue.lock().expect("reverse-dns queue poisoned").pop();
+                let Some(ip) = next else { return };
+                if let Some(name) = crate::dns::lookup(ip) {
+                    // A send error means the scan stopped waiting; the work is moot.
+                    if tx.send((ip, name)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    // Releasing our own handle lets `recv` end promptly once the pool drains,
+    // instead of waiting out the budget on a scan where every lookup answered.
+    drop(tx);
+
+    let rounds = ips.len().div_ceil(workers).max(1) as u32;
+    let deadline = Instant::now() + DNS_PER_LOOKUP * rounds;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((ip, name)) => {
+                found.insert(ip, name);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            // Every worker has returned, so no further names are coming.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    found
+}
+
+/// Human-readable elapsed time: sub-second phases keep one decimal, longer ones
+/// do not, and anything past ten minutes reads as minutes rather than as a
+/// five-digit number of milliseconds.
+fn human(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 600.0 {
+        format!("{secs:.0}s")
+    } else {
+        format!("{}m{:02}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+    }
+}
+
+/// Progress reporting for a phase that may block on the operating system.
+///
+/// The point is that a scan of a subnet full of machines that never answer
+/// spends real minutes inside `SendARP` and the ICMP handle. That used to be
+/// indistinguishable from a crashed process: the only line printed was the one
+/// naming the phase, and nothing followed it. A heartbeat turns dead air into
+/// visible elapsed time, and phases that finish inside a tick print nothing at
+/// all, so a fast scan is unaffected.
+struct Ticker {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Ticker {
+    fn start(label: &'static str) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut waited = Duration::ZERO;
+            loop {
+                // Polled in short slices so stopping does not have to wait out a
+                // whole tick before the scan continues.
+                for _ in 0..20 {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                waited += TICK;
+                eprintln!("  {label}: waiting, {:.0}s elapsed", waited.as_secs_f64());
+            }
+        });
+        Ticker {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -471,5 +667,25 @@ mod tests {
             "expected an explanatory note, got {:?}",
             report.stats.notes
         );
+    }
+
+    #[test]
+    fn elapsed_reads_as_seconds_then_minutes() {
+        assert_eq!(human(Duration::from_millis(4200)), "4.2s");
+        assert_eq!(human(Duration::from_millis(90_000)), "90s");
+        assert_eq!(human(Duration::from_secs(3725)), "62m05s");
+    }
+
+    #[test]
+    fn resolving_nothing_resolves_nothing() {
+        assert!(resolve_all(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_ticker_reports_nothing_until_it_is_stopped() {
+        // The heartbeat must not fire for a phase that finishes inside a tick,
+        // or every fast scan would gain a line of noise.
+        let ticker = Ticker::start("test");
+        ticker.stop();
     }
 }

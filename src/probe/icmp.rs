@@ -596,6 +596,11 @@ mod imp {
         /// `IcmpSendEcho2` is synchronous and cannot demultiplex, so targets are
         /// spread over a small thread pool. Unlike a raw socket there is no
         /// single-socket trick available here.
+        ///
+        /// The pool is bounded on purpose. Chunking by
+        /// `len.div_ceil(concurrency)` looks like it bounds the workers, but it
+        /// inverts: a /24 against the default concurrency of 256 gives a chunk
+        /// size of one and therefore a thread per address.
         pub fn probe_round(
             &mut self,
             targets: &[Ipv4Addr],
@@ -605,7 +610,8 @@ mod imp {
                 return Ok(Vec::new());
             }
 
-            let chunk = targets.len().div_ceil(self.concurrency).max(1);
+            let workers = crate::probe::blocking_workers(targets.len(), self.concurrency);
+            let chunk = targets.len().div_ceil(workers);
             let handle = self.handle;
             let timeout_ms = self.timeout_ms;
 

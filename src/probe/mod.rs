@@ -47,8 +47,29 @@ impl Default for ProbeConfig {
     }
 }
 
+/// Ceiling on worker threads for probes that are synchronous per target.
+///
+/// `SendARP` and `IcmpSendEcho2` offer no way to overlap several outstanding
+/// requests on one socket, so the only concurrency available is one thread per
+/// in-flight target. That makes a thread count a resource decision rather than a
+/// formatting one: every worker owns a stack and a thread-pool slot, so taking
+/// `--concurrency` literally on these paths costs far more than it buys and is
+/// enough to make a machine crawl. These calls are I/O-blocked, so a few dozen
+/// workers already keep every timeout window occupied.
+pub const MAX_BLOCKING_WORKERS: usize = 64;
+
+/// How many threads to use for a blocking, per-target probe of `total`
+/// targets: enough to keep the waits overlapped, never more than there are
+/// targets, and never the absurd.
+pub fn blocking_workers(total: usize, concurrency: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    concurrency.clamp(1, MAX_BLOCKING_WORKERS).min(total)
+}
+
 /// The result of probing a single target.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub ip: Ipv4Addr,
     pub outcome: Outcome,
@@ -158,5 +179,24 @@ mod tests {
         assert!(cfg.ports.contains(&80));
         assert!(cfg.ports.contains(&443));
         assert!(cfg.ports.contains(&22));
+    }
+
+    #[test]
+    fn blocking_probes_never_explode_into_a_thread_per_address() {
+        // The whole point: a /24 must not become 256 threads.
+        assert_eq!(blocking_workers(256, 256), MAX_BLOCKING_WORKERS);
+        assert_eq!(blocking_workers(256, 3), 3);
+    }
+
+    #[test]
+    fn blocking_probes_never_exceed_the_target_count() {
+        assert_eq!(blocking_workers(4, 256), 4);
+        assert_eq!(blocking_workers(1, 256), 1);
+    }
+
+    #[test]
+    fn blocking_probes_survive_nonsense_concurrency() {
+        assert_eq!(blocking_workers(256, 0), 1, "a zero is raised to one");
+        assert_eq!(blocking_workers(0, 256), 0, "no targets, no workers");
     }
 }

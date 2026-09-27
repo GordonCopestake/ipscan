@@ -122,6 +122,37 @@ Scan your own subnet:
 ipscan
 ```
 
+A scan prints what it is about to do, and how each phase is getting on, before
+and while it runs. On a subnet full of machines that never answer, several probe
+methods spend real time blocked inside the operating system, so silence would
+be indistinguishable from a crash:
+
+```
+ipscan 0.1.0
+  target      192.168.0.0/24
+  interface   eth0 (192.168.0.79/24)
+  addresses   256
+  method      auto (arp, then icmp, then tcp)
+  timeout     1000ms, 1 retry
+  ports       80, 443, 22, 445, 3389, 8080
+
+reading the neighbour cache...
+  neighbour cache: 25 entries in 0.0s
+probing 256 on-link addresses with arp...
+  arp: waiting, 2s elapsed
+  arp: 4 alive of 256 in 6.1s
+probing 252 addresses with icmp...
+  via unprivileged datagram (no privileges needed)
+  icmp: 12 answered of 252 in 4.2s
+icmp gave no answer for 240 addresses, trying tcp...
+  tcp: 6 answered of 1440 connects in 1.4s
+done: 18 hosts in 11.7s
+```
+
+That goes to **stderr**, so machine-readable output stays clean when it is
+redirected or piped. It appears by default only when stderr is a terminal; use
+`--verbose` to keep it in a log or a CI step, and `--quiet` to silence it.
+
 Scan anything:
 
 ```
@@ -178,7 +209,15 @@ failing.
 Linux, macOS, and Windows are supported. ICMP uses an unprivileged datagram
 socket on Unix and `IcmpSendEcho2` on Windows, ARP uses `AF_PACKET` on Linux and
 `SendARP` on Windows, and the neighbour table is read from `/proc/net/arp`,
-`arp -n`, or `GetIpNetTable2` respectively.
+`arp -n`, or `GetIpNetTable` respectively.
+
+Some platform APIs are synchronous per target and have no timeout of their own,
+so a probe built on them cannot overlap requests the way an event loop can.
+`ipscan` runs those across a bounded pool of worker threads rather than in a
+loop, and reports elapsed time while they run, so a Windows scan of a sparse
+subnet takes seconds instead of minutes. The cap is deliberate: thread-per-
+request means a thread and a stack per in-flight target, so a large
+`--concurrency` is clamped on these paths rather than taken literally.
 
 ## Licence
 

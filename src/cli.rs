@@ -177,6 +177,17 @@ impl Cli {
         }
     }
 
+    /// Whether progress reporting is wanted.
+    ///
+    /// On by default when stderr is a terminal, because a scan blocks inside
+    /// operating-system calls for long enough that silence reads as a crash.
+    /// It goes to stderr, so a redirected or piped stdout is unaffected, and
+    /// `--verbose` forces it on for the cases stderr is not a terminal but a
+    /// human is watching — a log file, a CI step, a `tee`.
+    pub fn wants_progress(&self) -> bool {
+        !self.quiet && (self.verbose || std::io::IsTerminal::is_terminal(&std::io::stderr()))
+    }
+
     pub fn to_plan(&self, targets: TargetSet, iface: Option<Interface>) -> ScanPlan {
         ScanPlan {
             targets,
@@ -185,7 +196,7 @@ impl Cli {
             interface: iface,
             resolve_hostnames: self.dns,
             include_cached: self.cached,
-            progress: self.verbose,
+            progress: self.wants_progress(),
         }
     }
 

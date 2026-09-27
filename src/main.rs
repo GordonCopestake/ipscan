@@ -46,6 +46,16 @@ fn real_main() -> Result<u8> {
     }
 
     let plan = cli.to_plan(targets, iface);
+
+    // Say what is about to happen *before* the first packet. A scan of a real
+    // subnet spends a long time inside blocking operating-system calls, and
+    // until it printed the first line the process was indistinguishable from
+    // one that had wedged. This goes to stderr, so redirecting stdout to a file
+    // or a pipe still yields clean machine-readable output.
+    if plan.progress {
+        banner(&plan);
+    }
+
     let report = ipscan::scan::run(&plan)?;
 
     // The same renderer serves stdout and files, so `-o` and `-f` always agree.
@@ -69,4 +79,45 @@ fn real_main() -> Result<u8> {
     }
 
     Ok(EXIT_OK)
+}
+
+/// Print the plan before it runs, so the user can see the shape of the job and
+/// abort it early if it is not what they meant.
+fn banner(plan: &ipscan::scan::ScanPlan) {
+    use ipscan::scan::MethodChoice;
+
+    let ports = plan
+        .config
+        .ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let method = match plan.method {
+        MethodChoice::Auto => "auto (arp, then icmp, then tcp)",
+        MethodChoice::Arp => "arp only",
+        MethodChoice::Icmp => "icmp only",
+        MethodChoice::Tcp => "tcp only",
+    };
+
+    eprintln!("ipscan {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("  target      {}", plan.targets.spec());
+    match &plan.interface {
+        Some(i) => eprintln!("  interface   {} ({}/{})", i.name, i.addr, i.prefix),
+        None => eprintln!("  interface   none detected"),
+    }
+    eprintln!("  addresses   {}", plan.targets.len());
+    eprintln!("  method      {method}");
+    eprintln!(
+        "  timeout     {}ms, {} retr{}",
+        plan.config.timeout.as_millis(),
+        plan.config.retries,
+        if plan.config.retries == 1 { "y" } else { "ies" }
+    );
+    eprintln!("  ports       {ports}");
+    if plan.resolve_hostnames {
+        eprintln!("  hostnames   reverse-resolving enabled");
+    }
+    eprintln!();
 }

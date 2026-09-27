@@ -422,12 +422,11 @@ mod platform {
     pub struct Inner {
         timeout: Duration,
         source: Option<Ipv4Addr>,
+        concurrency: usize,
     }
 
     /// `SendARP` lives in iphlpapi and works for ordinary users, so unlike the
-    /// Unix raw-socket path this needs no capability check. It is still a
-    /// per-target API call rather than a single broadcast, so it scales worse
-    /// than the Linux implementation.
+    /// Unix raw-socket path this needs no capability check.
     pub fn availability() -> Availability {
         Availability::ok("SendARP (no privileges needed)")
     }
@@ -437,6 +436,7 @@ mod platform {
             Ok(Inner {
                 timeout: cfg.timeout,
                 source: cfg.source,
+                concurrency: cfg.concurrency,
             })
         }
 
@@ -444,28 +444,59 @@ mod platform {
             self.timeout
         }
 
+        /// `SendARP` is synchronous and per-target: it blocks until that one
+        /// address answers or the stack gives up on it. Called in a plain loop
+        /// those waits add up, so a /24 turns into hundreds of back-to-back
+        /// stalls and reads as a hang. The waits are independent, so they are
+        /// overlapped across a bounded pool instead: the wall clock becomes
+        /// `targets / workers` timeouts rather than `targets` of them.
         pub fn probe_round(&mut self, targets: &[Ipv4Addr]) -> Result<Vec<Reply>> {
-            let mut out = Vec::new();
-            for &ip in targets {
-                if self.send_one(ip) {
-                    out.push(Reply::new(ip, Outcome::Alive));
-                }
+            let workers = crate::probe::blocking_workers(targets.len(), self.concurrency);
+            if workers == 0 {
+                return Ok(Vec::new());
             }
-            Ok(out)
-        }
+            let chunk = targets.len().div_ceil(workers);
+            let source = self.source;
 
-        /// `SendARP` takes both addresses as `u32` in network byte order and
-        /// writes the hardware address into a caller-supplied buffer, returning
-        /// the number of bytes written. Zero means the host did not answer.
-        fn send_one(&self, ip: Ipv4Addr) -> bool {
-            let dest = u32::from_ne_bytes(ip.octets());
-            let src = u32::from_ne_bytes(self.source.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
+            let answered: Vec<Ipv4Addr> = std::thread::scope(|scope| {
+                let handles: Vec<_> = targets
+                    .chunks(chunk)
+                    .map(|batch| {
+                        scope.spawn(move || {
+                            let mut out = Vec::new();
+                            for &ip in batch {
+                                if send_one(source, ip) {
+                                    out.push(ip);
+                                }
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
 
-            let mut mac = [0u8; 6];
-            let mut len = mac.len() as u32;
-            let rc = unsafe { SendARP(dest, src, mac.as_mut_ptr().cast(), &mut len as *mut u32) };
-            rc == 0 && len == 6 && !crate::host::MacAddr::from_bytes(mac).is_broadcast()
+            Ok(answered
+                .into_iter()
+                .map(|ip| Reply::new(ip, Outcome::Alive))
+                .collect())
         }
+    }
+
+    /// `SendARP` takes both addresses as `u32` in network byte order and writes
+    /// the hardware address into a caller-supplied buffer, returning the number
+    /// of bytes written. Zero means the host did not answer.
+    fn send_one(source: Option<Ipv4Addr>, ip: Ipv4Addr) -> bool {
+        let dest = u32::from_ne_bytes(ip.octets());
+        let src = u32::from_ne_bytes(source.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
+
+        let mut mac = [0u8; 6];
+        let mut len = mac.len() as u32;
+        let rc = unsafe { SendARP(dest, src, mac.as_mut_ptr().cast(), &mut len as *mut u32) };
+        rc == 0 && len == 6 && !crate::host::MacAddr::from_bytes(mac).is_broadcast()
     }
 }
 
