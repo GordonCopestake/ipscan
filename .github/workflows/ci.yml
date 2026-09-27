@@ -51,11 +51,19 @@ jobs:
       # traced to the specific missing entry point.
       - name: Dump Windows imports
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: cmd
+        shell: pwsh
         run: |
-          cargo build --locked --target %target% >nul 2>&1 || cargo build --locked --target x86_64-pc-windows-msvc
-          dumpbin /imports target\x86_64-pc-windows-msvc\debug\ipscan.exe > imports.txt 2>&1
-          type imports.txt
+          cargo build --locked --target x86_64-pc-windows-msvc
+          $dumpbin = Get-ChildItem `
+            "C:\Program Files\Microsoft Visual Studio\*\Enterprise\VC\Tools\MSVC\*\bin\HostX64\x64\dumpbin.exe" `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) {
+            "dumpbin not found"
+            Get-ChildItem "C:\Program Files\Microsoft Visual Studio" | Select-Object Name
+            exit 0
+          }
+          "using $($dumpbin.FullName)"
+          & $dumpbin.FullName /imports "target\x86_64-pc-windows-msvc\debug\ipscan.exe"
 
       # Unit tests need no external network beyond loopback, so they run on
       # every platform to cover the native probe backends too.
