@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.1.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.1.1-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.1.2-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.1.2-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.1.2-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.1.1
+ipscan 0.1.2
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
