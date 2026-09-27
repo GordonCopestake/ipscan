@@ -2,7 +2,7 @@
 //!
 //! `ToSocketAddrs` looks *forward*, and given a bare address it just parses it,
 //! so it cannot answer this. Each platform therefore gets the call it actually
-//! has: `getnameinfo` on Unix, `GetAddrInfoW` on Windows.
+//! has: `getnameinfo` on Unix, `GetAddrInfoExW` on Windows.
 //!
 //! Every lookup here is a blocking call to a resolver that may be slow or
 //! absent, so callers must run them somewhere they cannot stall the scan.
@@ -88,7 +88,8 @@ mod imp {
     use std::net::Ipv4Addr;
 
     use windows::Win32::Networking::WinSock::{
-        ADDRINFOW, AF_INET, AI_CANONNAME, GetAddrInfoW, WSACleanup, WSADATA, WSAStartup,
+        ADDRINFOEXW, AF_INET, AI_CANONNAME, FreeAddrInfoExW, GetAddrInfoExW, WSACleanup, WSADATA,
+        WSAStartup,
     };
 
     /// Reverse-resolve `ip`, returning `None` if there is no PTR record.
@@ -100,18 +101,29 @@ mod imp {
         let node: Vec<u16> = ip.to_string().encode_utf16().chain([0]).collect();
         // A numeric node with AI_CANONNAME is how Winsock is asked for the PTR
         // record rather than for another forward lookup.
-        let hints = ADDRINFOW {
+        let hints = ADDRINFOEXW {
             ai_flags: AI_CANONNAME as i32,
             ai_family: AF_INET.0 as i32,
             ..Default::default()
         };
-        let mut result: *mut ADDRINFOW = std::ptr::null_mut();
+        let mut result: *mut ADDRINFOEXW = std::ptr::null_mut();
+        // The `Ex` family of calls is used rather than `GetAddrInfoW` because
+        // the plain `FreeAddrInfo` is absent from the `windows` bindings. Declaring
+        // it by hand would mean a second `ws2_32` import block, and the linker
+        // resolves the resulting duplicate descriptor to ordinals taken from the
+        // import library, which does not match the real DLL.
         let rc = unsafe {
-            GetAddrInfoW(
+            GetAddrInfoExW(
                 windows::core::PCWSTR::from_raw(node.as_ptr()),
                 windows::core::PCWSTR::null(),
+                0,
+                None,
                 Some(&raw const hints),
                 &raw mut result,
+                None,
+                None,
+                None,
+                None,
             )
         };
         if rc != 0 || result.is_null() {
@@ -134,17 +146,10 @@ mod imp {
 
         // The block chain is only released once the name has been copied out.
         unsafe {
-            FreeAddrInfo(result);
+            FreeAddrInfoExW(Some(&raw const *result));
         }
         found
     }
-
-    // `FreeAddrInfo` is not in the `windows` bindings, which only carry the `Ex`
-    // variants, so it is declared here. `link!` is the same mechanism the
-    // `windows` crate uses internally: it imports straight from the DLL with
-    // `+verbatim`/`undecorated`, which a plain `#[link(name = ...)]` extern
-    // block cannot do for these symbols.
-    windows_link::link!("ws2_32.dll" "system" fn FreeAddrInfo(addr_info: *mut ADDRINFOW) -> i32);
 
     /// Starts Winsock for the lifetime of the guard and undoes it on drop.
     struct WinsockGuard;
