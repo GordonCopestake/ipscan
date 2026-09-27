@@ -68,7 +68,11 @@ jobs:
             # unpacking does not add a pointless directory level.
             tar -czf "out/$stem.tar.gz" -C dist .
           else
-            (cd dist && zip -r "../out/$stem.zip" .)
+            # Git Bash on Windows ships no zip(1), so hand the packing to
+            # PowerShell, which is always present on the runner. `dist/*` keeps
+            # the archive contents at the root, as the tar branch does.
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path 'dist/*' -DestinationPath 'out/$stem.zip' -Force"
           fi
           echo "archive=$stem.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
 
