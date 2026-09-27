@@ -47,23 +47,22 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --check
 
-      # Temporary: dump the raw-dylib import table so a failing loader can be
-      # traced to the specific missing entry point.
-      - name: Dump Windows imports
+      # Temporary: is a loader failure specific to this crate, or does a trivial
+      # binary fail the same way on this runner image?
+      - name: Baseline: does a hello-world crate load?
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
+          $d = Join-Path $env:RUNNER_TEMP hello
+          New-Item -ItemType Directory -Force -Path $d | Out-Null
+          Set-Location $d
+          cargo init --name hello --bin | Out-Null
+          cargo test 2>&1 | Select-Object -Last 6
+          "--- now the real binary ---"
+          Set-Location $env:GITHUB_WORKSPACE
           cargo build --locked --target x86_64-pc-windows-msvc
-          $dumpbin = Get-ChildItem `
-            "C:\Program Files\Microsoft Visual Studio\*\Enterprise\VC\Tools\MSVC\*\bin\HostX64\x64\dumpbin.exe" `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dumpbin) {
-            "dumpbin not found"
-            Get-ChildItem "C:\Program Files\Microsoft Visual Studio" | Select-Object Name
-            exit 0
-          }
-          "using $($dumpbin.FullName)"
-          & $dumpbin.FullName /imports "target\x86_64-pc-windows-msvc\debug\ipscan.exe"
+          & "target\x86_64-pc-windows-msvc\debug\ipscan.exe" --version
+          "ipscan.exe exit code: $LASTEXITCODE"
 
       # Unit tests need no external network beyond loopback, so they run on
       # every platform to cover the native probe backends too.
