@@ -81,7 +81,10 @@ jobs:
         run: |
           set -euo pipefail
           a="${{ steps.collect.outputs.archive }}"
-          sha256sum "out/$a" > "out/$a.sha256"
+          # Hash from inside `out/` so the checksum file names the archive
+          # alone, and `sha256sum -c <file>.sha256` works in whatever directory
+          # the user downloaded both files into.
+          (cd out && sha256sum -- "$a" > "$a.sha256")
           cat "out/$a.sha256"
 
       - uses: actions/upload-artifact@v4
