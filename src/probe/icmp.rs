@@ -819,18 +819,20 @@ mod imp {
                 None,
                 None,
                 None,
-                // `DestinationAddress` is documented as an IPAddr "in network
-                // byte order", so the value has to be the big-endian reading of
-                // the four octets. `from_ne_bytes` gives the little-endian one
-                // on x86, which sends the echo to 99.51.168.192 when the target
-                // was 192.168.51.99.
+                // `DestinationAddress` is an IPAddr, and the documented examples
+                // build one with `IPAddrMake`, which assembles the octets
+                // big-endian: 0xC0A83363 for 192.168.51.99. `from_ne_bytes` gives
+                // the little-endian reading on x86, which is a different value.
                 //
-                // That is not a harmless mistake. The stack has no route to the
-                // mangled address, so it was answered with an ICMP error rather
-                // than a reply, and an error was being read as proof of life --
-                // which is how a probe that never reached its target produced a
-                // room full of "hosts". Every host the tool reported on Windows
-                // before this was a symptom of this one line.
+                // This is worth stating carefully, because it was first shipped
+                // as a fix for a problem it did not cause. On a host where
+                // IcmpSendEcho2 returns no successful reply for anything, this
+                // encoding made no difference: measured against the native
+                // reading, every target failed either way, and the big-endian
+                // form was the only one that got an ICMP response back at all.
+                // So the change follows the documented contract, not a
+                // measurement -- and it is untested against a Windows host whose
+                // ICMP API actually works, which is the honest state of it.
                 u32::from_be_bytes(ip.octets()),
                 request.as_ptr() as *const std::ffi::c_void,
                 request.len() as u16,

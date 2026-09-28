@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.4.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.4.1-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.4.2-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.4.2-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.4.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.4.2-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.4.1
+ipscan 0.4.2
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
@@ -299,6 +299,21 @@ alongside the rest.
 Loopback and off-link addresses are exempt from `--strict` either way. A packet
 to `127.0.0.0/8` never reaches a wire, so ARP could not have named it, and
 demanding a hardware address there demands the impossible.
+
+### When ICMP reports nothing
+
+`ipscan` will tell you when the ICMP phase found nothing, and on Windows that can
+be a property of the machine rather than of the network. A Windows host was found
+where `IcmpSendEcho2` returns no successful echo reply for *any* address --
+loopback, several virtual adapters, or a public address -- while `ping` answers
+all of them. When that happens the phase is not broken in the sense of reporting
+hosts that are not there; it is reporting nothing, and the TCP and ARP phases
+carry the scan.
+
+`ping` working while `IcmpSendEcho2` does not is the signature. If you have a
+second Windows machine that behaves differently, it is worth finding out why:
+endpoint security products hook the network stack, and that is the first thing to
+rule out.
 
 ### The neighbour table is evidence, not proof
 
