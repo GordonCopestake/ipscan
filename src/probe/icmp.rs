@@ -656,6 +656,7 @@ mod windows_verdict_tests {
 
 #[cfg(windows)]
 mod imp {
+    use std::mem::size_of;
     use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
@@ -763,9 +764,9 @@ mod imp {
                                 OptionsSize: 0,
                                 OptionsData: std::ptr::null_mut(),
                             };
-                            // Windows fills in the ICMP_ECHO_REPLY struct
-                            // itself, so this only has to be big enough for that
-                            // plus the payload we sent.
+                            // Windows writes an `IP_OPTION_INFORMATION`, then the
+                            // `ICMP_ECHO_REPLY`, then the echoed request. All
+                            // three have to fit or the call fails outright.
                             let mut reply_buf = [0u8; 1024];
                             let mut out = out;
                             for &ip in batch {
@@ -835,11 +836,31 @@ mod imp {
         // `ICMP_ECHO_REPLY`, not a bare ICMP header, so the verdict is in the
         // struct rather than in the bytes. Windows already measures the round
         // trip for us, so the wall clock is only used as a fallback.
-        if reply_buf.len() < size_of::<ICMP_ECHO_REPLY>() {
+        // The reply does not start at the beginning of the buffer.
+        //
+        // `IcmpSendEcho2` takes a pointer to the options the caller wants echoed
+        // back, and when that pointer is non-NULL the reply buffer is laid out as
+        // an `IP_OPTION_INFORMATION` -- the options as they were sent, filled in
+        // by the stack -- immediately followed by the `ICMP_ECHO_REPLY` and then
+        // the echoed data.
+        //
+        // Reading the reply from offset zero therefore reads the options header
+        // as if it were the reply. `Address` comes out as the Ttl, Tos and Flags
+        // the tool itself asked for, which is never the address it pinged, so
+        // every genuine echo reply was rejected as coming from somebody else and
+        // the ICMP phase reported nothing at all. Worse, `Status` then reads as
+        // zero -- which is `IP_SUCCESS` -- so a target that was never there
+        // looked like a success too.
+        //
+        // `size_of` is used rather than a literal because the structure's size is
+        // pointer-alignment dependent: 24 bytes on x86-64, 16 on x86.
+        let opt_bytes = size_of::<IP_OPTION_INFORMATION>();
+        if reply_buf.len() < opt_bytes + size_of::<ICMP_ECHO_REPLY>() {
             return None;
         }
-        let echo: ICMP_ECHO_REPLY =
-            unsafe { std::ptr::read_unaligned(reply_buf.as_ptr() as *const ICMP_ECHO_REPLY) };
+        let echo: ICMP_ECHO_REPLY = unsafe {
+            std::ptr::read_unaligned(reply_buf.as_ptr().add(opt_bytes) as *const ICMP_ECHO_REPLY)
+        };
 
         let rtt = if echo.RoundTripTime > 0 {
             Some(Duration::from_millis(u64::from(echo.RoundTripTime)))
@@ -881,6 +902,72 @@ mod imp {
             // did. Neither is evidence about the target.
             None => None,
         }
+    }
+}
+
+/// The reply is not at the start of the buffer, and getting that wrong made the
+/// ICMP phase report nothing at all while appearing to work.
+#[cfg(all(test, windows))]
+mod reply_layout {
+    use std::mem::size_of;
+    use std::net::Ipv4Addr;
+
+    use windows::Win32::NetworkManagement::IpHelper::{ICMP_ECHO_REPLY, IP_OPTION_INFORMATION};
+
+    use super::windows_verdict;
+
+    #[test]
+    fn the_echo_reply_sits_after_the_options_header() {
+        // Build a buffer the way Windows fills one in when RequestOptions is
+        // non-NULL: the options header first, then the reply, then the data.
+        let opt_bytes = size_of::<IP_OPTION_INFORMATION>();
+        let opts = IP_OPTION_INFORMATION {
+            Ttl: 128,
+            Tos: 0,
+            Flags: 0,
+            OptionsSize: 0,
+            OptionsData: std::ptr::null_mut(),
+        };
+        let target = Ipv4Addr::new(192, 168, 51, 99);
+        let echo = ICMP_ECHO_REPLY {
+            Address: u32::from(target),
+            Status: 0, // IP_SUCCESS
+            RoundTripTime: 3,
+            DataSize: 32,
+            Data: std::ptr::null_mut(),
+            Reserved: 0,
+            Options: opts,
+        };
+
+        let mut buf = vec![0u8; opt_bytes + size_of::<ICMP_ECHO_REPLY>() + 64];
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr() as *mut IP_OPTION_INFORMATION, opts);
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(opt_bytes) as *mut ICMP_ECHO_REPLY,
+                echo,
+            );
+        }
+
+        // Reading at the offset the API actually uses recovers the reply.
+        let got = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(opt_bytes) as *const ICMP_ECHO_REPLY)
+        };
+        assert_eq!(got.Status, 0);
+        assert_eq!(Ipv4Addr::from(got.Address), target);
+        assert_eq!(
+            windows_verdict(got.Status, Ipv4Addr::from(got.Address) == target),
+            Some(super::Outcome::Alive)
+        );
+
+        // Reading at offset zero -- the bug -- gets the options header instead, so
+        // the address is the Ttl and Tos the tool asked for, never the target, and
+        // the reply is discarded.
+        let wrong = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const ICMP_ECHO_REPLY) };
+        assert_ne!(
+            Ipv4Addr::from(wrong.Address),
+            target,
+            "offset zero must not be mistaken for the reply"
+        );
     }
 }
 
