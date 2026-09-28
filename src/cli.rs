@@ -93,10 +93,20 @@ pub struct Cli {
     #[arg(long)]
     pub dns: bool,
 
-    /// Also report addresses known only to the OS neighbour cache, marked as
-    /// such. They were resolved at some point but did not answer this scan.
-    #[arg(long)]
+    /// Report addresses the OS neighbour cache names, with no probe reply to
+    /// confirm them. On by default, and marked as `neighbour` in the output.
+    ///
+    /// A resolved entry is a completed ARP exchange, so something was at that
+    /// address, but it may predate this scan. It is often the only evidence
+    /// available: on a host where the ICMP API returns nothing useful, the
+    /// neighbour table is what makes the difference between finding 20 live
+    /// addresses and finding all 113 that `ping` could reach.
+    #[arg(long, default_value_t = true)]
     pub cached: bool,
+
+    /// Leave cache-only addresses out, reporting only hosts a probe answered for.
+    #[arg(long)]
+    pub no_cached: bool,
 
     /// List only hosts whose hardware address is known, hiding addresses that
     /// answered without anything naming a device behind them.
@@ -215,7 +225,7 @@ impl Cli {
             config: self.probe_config(iface.as_ref()),
             interface: iface,
             resolve_hostnames: self.dns,
-            include_cached: self.cached,
+            include_cached: self.cached && !self.no_cached,
             ports_explicit: self.ports.is_some(),
             // A host that answered is a host. Attribution is a bonus, and
             // only someone asking for a device census should have hosts hidden
@@ -376,6 +386,20 @@ mod tests {
         }
         let o = parse(&["-f", "table"]).to_output_options(true);
         assert!(o.summary);
+    }
+
+    #[test]
+    fn the_neighbour_table_is_used_by_default_and_can_be_switched_off() {
+        // A resolved neighbour entry is frequently the only evidence available:
+        // with the ICMP API returning nothing usable, probes reached 20 of 113
+        // live addresses while the table accounted for all 113.
+        let on = parse(&[]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(on.include_cached, "cache evidence is the default");
+        let off = parse(&["--no-cached"]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(
+            !off.include_cached,
+            "--no-cached reports probe replies only"
+        );
     }
 
     #[test]

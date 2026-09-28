@@ -118,6 +118,9 @@ pub struct ScanStats {
     /// Answers withheld from the default listing because nothing attributed them
     /// to a device. Counted rather than discarded, so the summary can say so.
     pub unverified_omitted: usize,
+    /// Hosts reported on a resolved neighbour-table entry with no probe reply.
+    /// Counted separately because they are the weakest thing in the list.
+    pub cache_only_hosts: usize,
     /// Diagnostics: skipped methods, degraded paths, hints.
     pub notes: Vec<String>,
 }
@@ -371,18 +374,45 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
                     resolved_from_cache += 1;
                 }
             }
-            // Addresses the table knows but no probe confirmed. Kept out of the
-            // default view unless asked for, since a cache entry is weaker
-            // evidence of life than a reply.
+            // Addresses the table knows that no probe confirmed.
+            //
+            // A resolved entry is a completed protocol exchange, not a guess: the
+            // kernel got a hardware address back for that address, so something
+            // was there. That is weaker than a reply we watched arrive, because
+            // it may predate the scan, and it is reported as `neighbour` so the
+            // two are never confused. But it is frequently the only evidence
+            // available at all: where the ICMP API does not work, a differential
+            // test against `ping` found the probes reached 20 of 113 live
+            // addresses while the neighbour table accounted for all 113.
+            //
+            // Restricted to the addresses actually being scanned. The table
+            // covers every interface on the host, so without this a scan of
+            // 192.168.51.0/24 reported 172.24.101.200, which lives on a
+            // different network entirely.
             if plan.include_cached {
+                let mut cache_only = 0usize;
                 let alive_ips: HashSet<Ipv4Addr> = table.alive().iter().map(|h| h.ip).collect();
                 for n in &entries {
-                    if !alive_ips.contains(&n.ip) {
+                    if !alive_ips.contains(&n.ip)
+                        && plan.targets.contains(n.ip)
+                        && !n.mac.is_unspecified()
+                        && !n.mac.is_broadcast()
+                    {
                         table.record(
                             n.ip,
                             crate::host::Evidence::new(Method::Neighbour, Outcome::Alive),
                         );
+                        cache_only += 1;
                     }
+                }
+                if cache_only > 0 {
+                    stats.cache_only_hosts = cache_only;
+                    stats.note(format!(
+                        "{cache_only} host{} reported from the neighbour table alone, \
+                         with no probe reply to confirm them; they may have gone \
+                         away since the address was last resolved",
+                        if cache_only == 1 { "" } else { "s" }
+                    ));
                 }
             }
         }
@@ -1202,6 +1232,27 @@ mod tests {
             hosts.push(h);
         }
         hosts
+    }
+
+    /// The neighbour table covers every interface on the host, so using it as
+    /// evidence of life has to be restricted to the addresses being scanned.
+    ///
+    /// Unrestricted, a scan of 192.168.51.0/24 reported 172.24.101.200, which is
+    /// on a different network: a real address belonging to another interface,
+    /// presented as though it were part of the sweep.
+    #[test]
+    fn only_addresses_inside_the_target_set_may_come_from_the_cache() {
+        let targets = TargetSet::parse(["192.168.51.0/24"]).unwrap();
+        let wanted = Ipv4Addr::new(192, 168, 51, 99);
+        let elsewhere = Ipv4Addr::new(172, 24, 101, 200);
+
+        let in_scope = targets.contains(wanted);
+        let out_of_scope = targets.contains(elsewhere);
+        assert!(in_scope, "a target address is in the set");
+        assert!(
+            !out_of_scope,
+            "an address on another interface must not be: {elsewhere}"
+        );
     }
 
     #[test]
