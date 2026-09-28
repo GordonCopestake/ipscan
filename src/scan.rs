@@ -828,17 +828,22 @@ fn run_arp(
     match ArpProber::new(&plan.config) {
         Ok(mut prober) => {
             stats.arp_requests += on_link.len() as u64;
-            if plan.progress {
-                eprintln!("probing {} on-link addresses with arp...", on_link.len());
-            }
+            // Reported once, and the count of deliberately-skipped targets is
+            // part of the same line: "1 alive of 120" beside a cache of 134
+            // otherwise reads as a broken sweep rather than as 120 probes chosen
+            // because the table already answered for the rest.
             let skipped = cached_mac.iter().filter(|ip| eligible.contains(ip)).count();
-            if plan.progress && skipped > 0 {
-                eprintln!(
-                    "probing {} on-link addresses with arp ({} already named by the \
-                     neighbour table)...",
-                    on_link.len(),
-                    skipped
-                );
+            if plan.progress {
+                if skipped > 0 {
+                    eprintln!(
+                        "probing {} on-link addresses with arp ({} already named by the \
+                         neighbour table)...",
+                        on_link.len(),
+                        skipped
+                    );
+                } else {
+                    eprintln!("probing {} on-link addresses with arp...", on_link.len());
+                }
             }
             let ticker = Ticker::start("arp");
             let phase_started = Instant::now();
