@@ -492,8 +492,11 @@ mod platform {
     /// learn that ICMP and TCP cannot, leaving the MAC column empty on the
     /// platform where it should be full.
     fn send_one(source: Option<Ipv4Addr>, ip: Ipv4Addr) -> Option<crate::host::MacAddr> {
-        let dest = u32::from_ne_bytes(ip.octets());
-        let src = u32::from_ne_bytes(source.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
+        // Both arguments are IPAddr "in network byte order", so the value has to
+        // be the big-endian reading of the octets. `from_ne_bytes` is the
+        // little-endian one on x86 and asks about a different address entirely.
+        let dest = u32::from_be_bytes(ip.octets());
+        let src = u32::from_be_bytes(source.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
 
         let mut mac = [0u8; 6];
         let mut len = mac.len() as u32;

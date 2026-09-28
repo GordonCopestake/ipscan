@@ -819,7 +819,19 @@ mod imp {
                 None,
                 None,
                 None,
-                u32::from_ne_bytes(ip.octets()),
+                // `DestinationAddress` is documented as an IPAddr "in network
+                // byte order", so the value has to be the big-endian reading of
+                // the four octets. `from_ne_bytes` gives the little-endian one
+                // on x86, which sends the echo to 99.51.168.192 when the target
+                // was 192.168.51.99.
+                //
+                // That is not a harmless mistake. The stack has no route to the
+                // mangled address, so it was answered with an ICMP error rather
+                // than a reply, and an error was being read as proof of life --
+                // which is how a probe that never reached its target produced a
+                // room full of "hosts". Every host the tool reported on Windows
+                // before this was a symptom of this one line.
+                u32::from_be_bytes(ip.octets()),
                 request.as_ptr() as *const std::ffi::c_void,
                 request.len() as u16,
                 Some(opts as *const IP_OPTION_INFORMATION),
@@ -902,6 +914,32 @@ mod imp {
             // did. Neither is evidence about the target.
             None => None,
         }
+    }
+}
+
+/// `IPAddr` arguments must be the big-endian reading of the four octets.
+///
+/// The two Windows entry points take their address as a `u32` documented "in
+/// network byte order". `from_ne_bytes` compiles, runs, and is correct on a
+/// big-endian host, so nothing catches it until an x86 build silently asks about
+/// a different address than the one it was given.
+#[cfg(all(test, windows))]
+mod address_byte_order {
+    use std::net::Ipv4Addr;
+
+    /// The value `IPAddrMake(192, 168, 51, 99)` produces, which is what the MSDN
+    /// examples pass and therefore what these APIs expect.
+    #[test]
+    fn a_destination_is_encoded_big_endian() {
+        let ip = Ipv4Addr::new(192, 168, 51, 99);
+        assert_eq!(
+            u32::from_be_bytes(ip.octets()),
+            0xC0A8_3363,
+            "network byte order is the big-endian reading"
+        );
+        // The little-endian reading asks about a completely different address,
+        // which is the bug this test exists to prevent.
+        assert_ne!(u32::from_ne_bytes(ip.octets()), 0xC0A8_3363);
     }
 }
 
