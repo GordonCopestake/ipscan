@@ -98,14 +98,23 @@ pub struct Cli {
     #[arg(long)]
     pub cached: bool,
 
-    /// List addresses that answered but which nothing attributed to a device.
+    /// List only hosts whose hardware address is known, hiding addresses that
+    /// answered without anything naming a device behind them.
     ///
-    /// Withheld by default. An address that answers ICMP on a directly-attached
-    /// link without ARP having named it is a contradiction: answering the echo
-    /// required resolving the target's hardware address first. A device echoing
-    /// on behalf of a range it merely routes produces exactly this, so counting
-    /// those answers as hosts reports a segment far fuller than it is. The count
-    /// is always in the summary, so nothing is lost by leaving them out.
+    /// Off by default, because finding alive hosts is the tool's job and a host
+    /// that answered is a host. The hardware address is a bonus, and a VM behind
+    /// a virtual switch is a real machine whether or not the sweep managed to
+    /// name it.
+    ///
+    /// Turning this on is a statement that you want a *device* census rather
+    /// than a *liveness* census. It matters on a segment where something answers
+    /// echo on behalf of a range it merely routes, because there the two are not
+    /// the same question: a device proxying for a /24 can make it look like 254
+    /// machines. Addresses hidden this way are always counted in the summary.
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Always list every address that answered, overriding --strict.
     #[arg(long)]
     pub include_unverified: bool,
 
@@ -208,7 +217,10 @@ impl Cli {
             resolve_hostnames: self.dns,
             include_cached: self.cached,
             ports_explicit: self.ports.is_some(),
-            include_unverified: self.include_unverified,
+            // A host that answered is a host. Attribution is a bonus, and
+            // only someone asking for a device census should have hosts hidden
+            // from them, so `--strict` opts *in* to withholding.
+            include_unverified: self.include_unverified || !self.strict,
             progress: self.wants_progress(),
         }
     }
@@ -364,6 +376,28 @@ mod tests {
         }
         let o = parse(&["-f", "table"]).to_output_options(true);
         assert!(o.summary);
+    }
+
+    #[test]
+    fn a_host_that_answered_is_a_host_unless_strict_is_asked_for() {
+        // The tool's job is finding alive hosts, so an address that answered is
+        // listed. Hiding it is available, but only on request: only someone
+        // asking for a *device* census wants a VM excluded because the sweep
+        // failed to name it.
+        let open = parse(&[]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(
+            open.include_unverified,
+            "responders must be listed by default"
+        );
+        let strict = parse(&["--strict"]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(
+            !strict.include_unverified,
+            "--strict is the opt-in to hiding unattributed answers"
+        );
+        // An explicit request to list everything wins over --strict.
+        let both = parse(&["--strict", "--include-unverified"])
+            .to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(both.include_unverified);
     }
 
     #[test]

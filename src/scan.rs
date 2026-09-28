@@ -438,11 +438,11 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         unattributed.len(),
         plan.include_unverified,
     );
-    if !plan.include_unverified && attributed.is_empty() && !unattributed.is_empty() {
+    if attributed.is_empty() && !unattributed.is_empty() {
         stats.note(format!(
-            "arp named none of the {} address{} that answered, so no answer here can \
-             be attributed to a device; the arp phase is ineffective on this \
-             interface and the results are listed unverified",
+            "no hardware address is known for any of the {} address{} that \
+             answered, so none can be named; the arp phase did not get an answer \
+             for this link and the results are listed without a MAC",
             unattributed.len(),
             if unattributed.len() == 1 { "" } else { "es" }
         ));
@@ -452,8 +452,8 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         stats.unverified_omitted = unattributed.len();
         if plan.progress {
             eprintln!(
-                "  note: omitting {} of the {} addresses that answered but were not \
-                 named by arp; pass --include-unverified to list them",
+                "  note: --strict is hiding {} of the {} addresses that answered but \
+                 have no known hardware address; drop --strict to list them",
                 unattributed.len(),
                 hosts.len()
             );

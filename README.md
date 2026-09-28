@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.1.9-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.1.9-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.2.0-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.1.9-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.1.9
+ipscan 0.2.0
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
@@ -201,7 +201,7 @@ Other useful flags:
 ipscan -L                       # list interfaces and their subnets
 ipscan --dns                    # reverse-resolve (slower)
 ipscan --cached                 # also show addresses only the OS cache knows
-ipscan --include-unverified     # list answers nothing could be attributed to
+ipscan --strict                 # list only hosts with a known hardware address
 ipscan --sort rtt               # order by latency, ip, or hostname
 ipscan -q                       # no summary line
 ipscan -v                       # per-stage progress and notes
@@ -282,18 +282,22 @@ The warning is deliberately quiet about a handful of unnamed hosts. A busy
 machine that dropped one ARP reply is ordinary, and a warning that fires on
 ordinary noise teaches you to ignore the warning that matters.
 
-Because such an answer is not a finding, it is not listed by default either. The
-shorter list is the one worth reading, and the summary always states how many were
-withheld, so the default view never loses an address silently. `--include-unverified`
-puts them back.
+Every address that answered is listed. Finding alive hosts is the tool's job,
+and a host that answered is a host -- a VM behind a virtual switch is a real
+machine whether or not the sweep managed to name it. The hardware address is a
+bonus, not a qualification, so its absence never hides a responder.
 
-Two guards keep that from becoming a way of hiding real machines. Loopback and
-off-link addresses are never held to it, because ARP could not have named them in
-the first place — a packet to `127.0.0.0/8` never reaches a wire, so demanding a
-hardware address for it demands the impossible. And if ARP named *nothing at all*,
-the phase is ineffective rather than authoritative, so the answers are kept and
-the failure is reported instead. Otherwise a virtual interface that cannot do ARP
-would turn a working scan into an empty one.
+`--strict` is the opt-in to the other question. It lists only hosts with a
+known hardware address, which is what you want when you are counting *devices*
+rather than detecting liveness -- on a segment where something answers echo for a
+range it merely routes, a liveness census and a device census are not the same
+number. Addresses hidden this way are always counted in the summary, so a shorter
+list is never mistaken for the whole sweep, and `--include-unverified` lists them
+alongside the rest.
+
+Loopback and off-link addresses are exempt from `--strict` either way. A packet
+to `127.0.0.0/8` never reaches a wire, so ARP could not have named it, and
+demanding a hardware address there demands the impossible.
 
 ### Asking the cache again, because a sweep loses replies
 
@@ -343,6 +347,12 @@ ipscan 192.168.1.0/24               # probes ports only where nothing else answe
 
 Addresses already shown to be dead are still skipped either way. Naming ports
 never turns into spending connects on addresses that have proved empty.
+
+Every open port is listed, not just the first one to answer. A host with 80, 443
+and 22 open is reported as `80,22,443`: retiring a target after its first
+conclusive answer made the column a sample of the host's services rather than a
+list of them. A refused connection proves the host is there but that the port is
+*not* open, so it is proof of life rather than a service and is not listed.
 
 ### ARP cache reuse avoids redundant probes
 

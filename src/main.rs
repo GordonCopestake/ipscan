@@ -94,6 +94,12 @@ fn banner(plan: &ipscan::scan::ScanPlan) {
         .collect::<Vec<_>>()
         .join(", ");
 
+    let ports_label = if plan.ports_explicit {
+        "ports"
+    } else {
+        "ports (fallback)"
+    };
+
     let method = match plan.method {
         MethodChoice::Auto => "auto (arp, then icmp, then tcp)",
         MethodChoice::Arp => "arp only",
@@ -115,7 +121,7 @@ fn banner(plan: &ipscan::scan::ScanPlan) {
         plan.config.retries,
         if plan.config.retries == 1 { "y" } else { "ies" }
     );
-    eprintln!("  ports       {ports}");
+    eprintln!("  {ports_label}       {ports}");
     if plan.resolve_hostnames {
         eprintln!("  hostnames   reverse-resolving enabled");
     }

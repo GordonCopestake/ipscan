@@ -94,27 +94,29 @@ impl TcpProber {
         // descriptor because descriptors get reused.
         let mut slots: Vec<Option<Pending>> = Vec::with_capacity(self.concurrency);
         let mut inflight: HashSet<usize> = HashSet::new();
-        let mut resolved: HashSet<Ipv4Addr> = HashSet::new();
         let mut replies: Vec<Reply> = Vec::new();
         let mut next_job = 0usize;
         let mut events = Events::new();
 
         loop {
-            // Fill up to the concurrency ceiling with unsettled targets.
+            // Fill up to the concurrency ceiling.
+            //
+            // Every port of every target is attempted, and a target is never
+            // retired after answering. Stopping at the first conclusive answer
+            // made the port column a sample rather than an inventory: a machine
+            // with 80, 443 and 22 open was reported as whichever of those came
+            // back first, and the other two silently disappeared. Asking which
+            // ports are open means asking about each of them, and the cost is
+            // bounded by `--concurrency` either way.
             while inflight.len() < self.concurrency && next_job < queue.len() {
                 let (ip, port) = queue[next_job];
                 next_job += 1;
-                if resolved.contains(&ip) {
-                    continue;
-                }
                 match start_connect(ip, port, self.source) {
                     Start::Connected => {
                         replies.push(Reply::new(ip, Outcome::Alive).with_port(port));
-                        resolved.insert(ip);
                     }
                     Start::Refused => {
                         replies.push(Reply::new(ip, Outcome::Filtered).with_port(port));
-                        resolved.insert(ip);
                     }
                     Start::InFlight(sock) => {
                         let key = slots.len();
@@ -165,10 +167,6 @@ impl TcpProber {
                 // reference to the descriptor.
                 let _ = poller.delete(&job.sock);
 
-                if resolved.contains(&job.ip) {
-                    continue;
-                }
-
                 // `take_error` reports the pending SO_ERROR and clears it, so it
                 // must be called exactly once per socket. Linux hands back a
                 // completed refusal as `Ok(Some(..))` rather than `Err(..)`, so
@@ -182,12 +180,10 @@ impl TcpProber {
                             .with_port(job.port)
                             .with_rtt(rtt),
                     );
-                    resolved.insert(job.ip);
                 } else if refused(&pending) {
                     // The host answered with a RST. It is up; it just will not
                     // talk to us on this port.
                     replies.push(Reply::new(job.ip, Outcome::Filtered).with_port(job.port));
-                    resolved.insert(job.ip);
                 }
                 // Anything else (timeout, host unreachable, route missing) says
                 // nothing about whether the host exists.
@@ -201,14 +197,13 @@ impl TcpProber {
             }
         }
 
-        // One answer per target, preferring the lowest port so the open-port
-        // column is stable between runs.
+        // Keep all open ports per target. Multiple rows for the same IP will be
+        // collapsed into a single host with all its open ports in the output.
         replies.sort_by(|a, b| {
             u32::from(a.ip)
                 .cmp(&u32::from(b.ip))
                 .then(a.port.cmp(&b.port))
         });
-        replies.dedup_by_key(|r| r.ip);
         Ok(replies)
     }
 }
@@ -453,20 +448,39 @@ mod tests {
     }
 
     #[test]
-    fn one_reply_per_target_even_with_many_ports() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let open = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let _ = listener.accept();
-        });
+    fn every_open_port_of_a_host_is_reported() {
+        // Two real listeners, so the host has two open ports at once. Retiring a
+        // target after its first answer -- which is what this used to do --
+        // reported one of them and lost the other, making the port column a
+        // sample of the host's services rather than a list of them.
+        let mut open_ports: Vec<u16> = Vec::new();
+        let mut keeps: Vec<TcpListener> = Vec::new();
+        for _ in 0..2 {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            open_ports.push(l.local_addr().unwrap().port());
+            keeps.push(l);
+        }
+        for l in keeps {
+            std::thread::spawn(move || {
+                let _ = l.accept();
+            });
+        }
 
-        let Some(closed) = confirmed_refusing_port() else {
-            eprintln!("skipping: no port on this host answers with a reset");
-            return;
-        };
-        let mut p = prober_on(&[open, closed, closed]);
+        let mut p = prober_on(&open_ports);
         let replies = p.probe_round(&[Ipv4Addr::LOCALHOST]).unwrap();
-        assert_eq!(replies.len(), 1, "targets must not be reported twice");
+
+        let mut found: Vec<u16> = replies
+            .iter()
+            .filter(|r| r.outcome == Outcome::Alive)
+            .filter_map(|r| r.port)
+            .collect();
+        found.sort_unstable();
+        let mut expected = open_ports.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            found, expected,
+            "both open ports must be reported, not just the first"
+        );
     }
 
     /// More targets than the concurrency limit, to exercise the refill path.
@@ -479,8 +493,8 @@ mod tests {
     #[test]
     fn many_targets_are_handled_with_a_small_socket_budget() {
         // Every address is genuinely present: the one with the listener accepts,
-        // and the rest refuse. That makes this a test of refill, deduplication,
-        // and reset handling at the same time.
+        // and the rest refuse. That makes this a test of refill and reset
+        // handling at the same time.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -495,24 +509,30 @@ mod tests {
         let mut p = prober_on(&[port, closed]);
         let replies = p.probe_round(&targets).unwrap();
 
+        // Two ports per address, and neither is retired after the first answer,
+        // so every address yields exactly two replies: one accept, one refusal.
         assert_eq!(
             replies.len(),
-            64,
-            "every loopback address answers, one reply each"
+            128,
+            "every loopback address answers on both probed ports"
         );
-        assert_eq!(replies[0].ip, Ipv4Addr::LOCALHOST);
-        assert_eq!(
-            replies[0].outcome,
-            Outcome::Alive,
-            "the address with the listener accepts"
-        );
-        for r in &replies[1..] {
+        // The one address with a listener accepts on that port and refuses on
+        // the other; every other address refuses on both.
+        for r in replies.iter().filter(|r| r.port != Some(port)) {
             assert_eq!(
                 r.outcome,
                 Outcome::Filtered,
                 "a refusal still proves the host exists: {r:?}"
             );
         }
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|r| r.ip == Ipv4Addr::LOCALHOST && r.port == Some(port))
+                .count(),
+            1,
+            "the address with the listener accepts on it"
+        );
     }
 
     /// Refilling the queue past the concurrency ceiling must not invent evidence.

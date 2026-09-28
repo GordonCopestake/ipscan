@@ -9,8 +9,47 @@ use std::fmt::Write as _;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::host::{Host, Outcome};
+use crate::host::{Host, Method, Outcome};
 use crate::scan::ScanReport;
+
+/// Every port this host answered on, lowest first.
+///
+/// A host commonly has more than one service open, and reporting only the
+/// lowest -- which is what stopping at the first conclusive answer did -- turns
+/// a service inventory into a sample of it. All of them are probed and all of
+/// them are shown.
+///
+/// Only `Alive` counts. A refused connection is proof the host is there but
+/// proof the port is *not* open, and listing `22` next to a host's real services
+/// because nothing was listening there would be a lie in a column whose entire
+/// purpose is to say which services are reachable.
+fn open_ports(h: &Host) -> Vec<u16> {
+    let mut ports: Vec<u16> = h
+        .evidence
+        .iter()
+        .filter(|e| e.method == Method::Tcp && e.outcome == Outcome::Alive)
+        .filter_map(|e| e.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// The open ports as one cell, e.g. `80,443`.
+fn ports_cell(h: &Host) -> Option<String> {
+    let ports = open_ports(h);
+    if ports.is_empty() {
+        None
+    } else {
+        Some(
+            ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
 
 /// Output shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
@@ -79,8 +118,11 @@ struct HostJson {
     alive: bool,
     hostname: Option<String>,
     mac: Option<String>,
-    /// An open TCP port, when the connect probe found one.
+    /// The lowest open TCP port, for compatibility with earlier output.
     port: Option<u16>,
+    /// Every open TCP port found on this host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ports: Vec<u16>,
     /// Best round-trip time across all methods, in milliseconds.
     rtt_ms: Option<f64>,
     ttl: Option<u8>,
@@ -213,11 +255,7 @@ fn render_csv(hosts: &[&Host]) -> Result<String> {
             h.ip.to_string(),
             h.hostname.clone().unwrap_or_default(),
             h.mac.map(|m| m.to_string()).unwrap_or_default(),
-            h.evidence
-                .iter()
-                .find_map(|e| e.port)
-                .map(|p| p.to_string())
-                .unwrap_or_default(),
+            ports_cell(h).unwrap_or_default(),
             h.best_rtt()
                 .map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0))
                 .unwrap_or_default(),
@@ -244,11 +282,7 @@ fn render_md(hosts: &[&Host], report: &ScanReport) -> String {
             h.ip,
             md_cell(h.hostname.as_deref()),
             md_cell(h.mac.map(|m| m.to_string()).as_deref()),
-            h.evidence
-                .iter()
-                .find_map(|e| e.port)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into()),
+            ports_cell(h).unwrap_or_else(|| "-".into()),
             h.best_rtt()
                 .map(|d| format!("{:.2} ms", d.as_secs_f64() * 1000.0))
                 .unwrap_or_else(|| "-".into()),
@@ -276,7 +310,8 @@ fn render_json(report: &ScanReport, hosts: &[&Host], opts: &OutputOptions) -> Re
             alive: h.is_alive(),
             hostname: h.hostname.clone(),
             mac: h.mac.map(|m| m.to_string()),
-            port: h.evidence.iter().find_map(|e| e.port),
+            port: open_ports(h).first().copied(),
+            ports: open_ports(h),
             rtt_ms: h.best_rtt().map(|d| d.as_secs_f64() * 1000.0),
             ttl: h.evidence.iter().find_map(|e| e.ttl),
             method: h.primary_method().map(|m| m.to_string()),
@@ -362,12 +397,7 @@ fn render_table(hosts: &[&Host], opts: &OutputOptions, wide: bool) -> String {
                 .mac
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| blank.clone());
-            let port = h
-                .evidence
-                .iter()
-                .find_map(|e| e.port)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| blank.clone());
+            let port = ports_cell(h).unwrap_or_else(|| blank.clone());
             let rtt = h
                 .best_rtt()
                 .map(|d| format!("{:.2} ms", d.as_secs_f64() * 1000.0))
@@ -901,6 +931,52 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hosts_alive"], 0);
+    }
+
+    #[test]
+    fn a_host_with_several_open_ports_lists_them_all() {
+        let mut h = Host::new("192.168.1.9".parse().unwrap());
+        h.add_evidence(
+            Evidence::new(Method::Tcp, Outcome::Alive)
+                .with_port(443)
+                .with_rtt(Duration::from_millis(3)),
+        );
+        h.add_evidence(
+            Evidence::new(Method::Tcp, Outcome::Alive)
+                .with_port(80)
+                .with_rtt(Duration::from_millis(1)),
+        );
+        // A refusal is not an open port and must not appear in the list.
+        h.add_evidence(Evidence::new(Method::Tcp, Outcome::Filtered).with_port(22));
+
+        assert_eq!(open_ports(&h), vec![80, 443]);
+
+        let out = render(
+            &report_with(vec![h.clone()]),
+            &OutputOptions {
+                summary: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(out.contains("80,443"), "every open port, in order: {out}");
+
+        // JSON carries the full set as well as the lowest, for old consumers.
+        let out = render(
+            &report_with(vec![h.clone()]),
+            &OutputOptions {
+                format: Format::Json,
+                summary: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["hosts"][0]["port"], 80,
+            "lowest port kept for compatibility"
+        );
+        assert_eq!(v["hosts"][0]["ports"], serde_json::json!([80, 443]));
     }
 
     #[test]
