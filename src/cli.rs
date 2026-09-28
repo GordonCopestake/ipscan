@@ -93,20 +93,23 @@ pub struct Cli {
     #[arg(long)]
     pub dns: bool,
 
-    /// Report addresses the OS neighbour cache names, with no probe reply to
-    /// confirm them. On by default, and marked as `neighbour` in the output.
+    /// Also report addresses the OS neighbour cache names that no probe answered
+    /// for, marked `neighbour` in the output.
     ///
-    /// A resolved entry is a completed ARP exchange, so something was at that
-    /// address, but it may predate this scan. It is often the only evidence
-    /// available: on a host where the ICMP API returns nothing useful, the
-    /// neighbour table is what makes the difference between finding 20 live
-    /// addresses and finding all 113 that `ping` could reach.
-    #[arg(long, default_value_t = true)]
-    pub cached: bool,
-
-    /// Leave cache-only addresses out, reporting only hosts a probe answered for.
+    /// Off by default. A resolved entry means an ARP exchange completed at some
+    /// point, which is weaker than a reply we watched arrive: the host may have
+    /// gone away since. Measured against `ping` on a live /24, the table
+    /// accounted for every address ping could reach but also carried 24 entries
+    /// for machines that had left, and a list that cannot be distinguished from
+    /// a real census by its own accuracy is worse than a short one.
+    ///
+    /// It costs recall where nothing else works. On a host whose ICMP API
+    /// returns nothing usable, the table is the only evidence there is: with
+    /// this off the scan reports 21 of the 116 addresses `ping` reaches, and
+    /// with it on, all 116 alongside those 24 stale entries. The count of
+    /// cache-only addresses is always in the summary either way.
     #[arg(long)]
-    pub no_cached: bool,
+    pub cached: bool,
 
     /// List only hosts whose hardware address is known, hiding addresses that
     /// answered without anything naming a device behind them.
@@ -225,7 +228,7 @@ impl Cli {
             config: self.probe_config(iface.as_ref()),
             interface: iface,
             resolve_hostnames: self.dns,
-            include_cached: self.cached && !self.no_cached,
+            include_cached: self.cached,
             ports_explicit: self.ports.is_some(),
             // A host that answered is a host. Attribution is a bonus, and
             // only someone asking for a device census should have hosts hidden
@@ -389,17 +392,15 @@ mod tests {
     }
 
     #[test]
-    fn the_neighbour_table_is_used_by_default_and_can_be_switched_off() {
-        // A resolved neighbour entry is frequently the only evidence available:
-        // with the ICMP API returning nothing usable, probes reached 20 of 113
-        // live addresses while the table accounted for all 113.
-        let on = parse(&[]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
-        assert!(on.include_cached, "cache evidence is the default");
-        let off = parse(&["--no-cached"]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
-        assert!(
-            !off.include_cached,
-            "--no-cached reports probe replies only"
-        );
+    fn the_neighbour_table_is_opt_in() {
+        // A resolved entry is a completed ARP exchange, but it may predate the
+        // scan. Measured against `ping` on a live /24 the table covered every
+        // address ping could reach *and* carried 24 entries for machines that
+        // had left, so it does not go in the default list.
+        let off = parse(&[]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(!off.include_cached, "only probed hosts by default");
+        let on = parse(&["--cached"]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(on.include_cached, "--cached asks for the table as well");
     }
 
     #[test]

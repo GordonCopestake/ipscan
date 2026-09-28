@@ -59,13 +59,13 @@ unpack it, and put `ipscan` on your `PATH`. No runtime or build tools needed.
 
 | Platform | File |
 |---|---|
-| Linux x86-64 | `ipscan-v0.3.1-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86-64 | `ipscan-v0.3.1-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `ipscan-v0.4.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86-64 | `ipscan-v0.4.0-x86_64-pc-windows-msvc.zip` |
 
 Each archive ships a `.sha256` file next to it. On Linux, verify before running:
 
 ```
-sha256sum -c ipscan-v0.3.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c ipscan-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 macOS and arm64 Linux builds are not published as binaries; build from source
@@ -128,7 +128,7 @@ methods spend real time blocked inside the operating system, so silence would
 be indistinguishable from a crash:
 
 ```
-ipscan 0.3.1
+ipscan 0.4.0
   target      192.168.0.0/24
   interface   eth0 (192.168.0.79/24)
   addresses   256
@@ -202,6 +202,7 @@ ipscan -L                       # list interfaces and their subnets
 ipscan --dns                    # reverse-resolve (slower)
 ipscan --cached                 # also show addresses only the OS cache knows
 ipscan --strict                 # list only hosts with a known hardware address
+ipscan --cached                 # also list addresses only the neighbour table names
 ipscan --sort rtt               # order by latency, ip, or hostname
 ipscan -q                       # no summary line
 ipscan -v                       # per-stage progress and notes
@@ -298,6 +299,25 @@ alongside the rest.
 Loopback and off-link addresses are exempt from `--strict` either way. A packet
 to `127.0.0.0/8` never reaches a wire, so ARP could not have named it, and
 demanding a hardware address there demands the impossible.
+
+### The neighbour table is evidence, not proof
+
+The table is read twice: once to order the sweep, and once afterwards to attach
+hardware addresses. A resolved entry means an ARP exchange completed at some
+point, which makes it a real device but not necessarily a device that is there
+*now*.
+
+It is also frequently the only evidence available. On a host whose ICMP API
+returns nothing usable, the table is what makes the difference between finding 21
+of the 116 addresses `ping` reaches and finding all of them.
+
+Both facts are true, so the choice is the operator's rather than the tool's:
+`--cached` lists addresses only the table names, and they appear as `neighbour`
+with no round-trip time so they can never be mistaken for hosts that answered.
+The default omits them, because measured against `ping` on a live /24 the table
+covered every address ping could reach *and* carried 24 entries for machines that
+had left. A list that cannot be told apart from a real census by its own
+accuracy is worse than a short one. The count is always in the summary.
 
 ### Asking the cache again, because a sweep loses replies
 
