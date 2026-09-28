@@ -174,9 +174,18 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         );
     }
     let seed: HashSet<Ipv4Addr> = cached.iter().map(|n| n.ip).collect();
-    // Addresses that already have a usable MAC in the neighbour cache need no
-    // active ARP probe -- the cache entry is fresher than any reply we'd get
-    // from a new request, and the late attribution pass will copy it in.
+    // Addresses the table already names. The active sweep skips them: the MAC is
+    // the thing it would learn, the table has it, and asking again costs a
+    // `SendARP` timeout per address for an answer we hold. Liveness is not lost
+    // by skipping -- the ICMP and TCP phases confirm it -- and the hardware
+    // address is recorded into the table below either way.
+    //
+    // The one thing this does cost is the ability to say the sweep *saw* the
+    // host. An address is in the table because something already resolved it,
+    // which is the same evidence the sweep would gather, so a cached hit cannot
+    // distinguish a live host from a stale one. The counts are reported
+    // separately for that reason: "1 alive of 121" on its own reads as a broken
+    // sweep rather than as 121 targets deliberately left alone.
     let cached_mac: HashSet<Ipv4Addr> = cached
         .iter()
         .filter(|n| !n.mac.is_unspecified() && !n.mac.is_broadcast())
@@ -792,6 +801,15 @@ fn run_arp(
             if plan.progress {
                 eprintln!("probing {} on-link addresses with arp...", on_link.len());
             }
+            let skipped = cached_mac.iter().filter(|ip| eligible.contains(ip)).count();
+            if plan.progress && skipped > 0 {
+                eprintln!(
+                    "probing {} on-link addresses with arp ({} already named by the \
+                     neighbour table)...",
+                    on_link.len(),
+                    skipped
+                );
+            }
             let ticker = Ticker::start("arp");
             let phase_started = Instant::now();
             let alive = match prober.probe_round(&on_link) {
@@ -813,11 +831,20 @@ fn run_arp(
             };
             ticker.stop();
             if plan.progress {
-                eprintln!(
-                    "  arp: {alive} alive of {} in {}",
-                    on_link.len(),
-                    human(phase_started.elapsed())
-                );
+                if skipped > 0 {
+                    eprintln!(
+                        "  arp: {alive} alive of {} probed in {} ({skipped} more were \
+                         already named by the neighbour table)",
+                        on_link.len(),
+                        human(phase_started.elapsed())
+                    );
+                } else {
+                    eprintln!(
+                        "  arp: {alive} alive of {} in {}",
+                        on_link.len(),
+                        human(phase_started.elapsed())
+                    );
+                }
             }
             true
         }
