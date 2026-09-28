@@ -33,6 +33,7 @@ pub const DEFAULT_MAX_HOSTS: u64 = 1_048_576;
                   ipscan 192.168.1.0/24           scan an explicit block\n  \
                   ipscan 192.168.1.1-254          scan an explicit range\n  \
                   ipscan 10.0.0.0/8 -p 80,443     scan a big block on two ports only\n  \
+                  ipscan -p 192.168.1.0/24        every live host, on 80,443,3389,22\n  \
                   ipscan -f json -o hosts.json     write JSON to a file\n  \
                   ipscan -f bare | nmap -iL -     pipe addresses into another tool\n  \
                   ipscan -L                      list local interfaces"
@@ -56,8 +57,28 @@ pub struct Cli {
     pub method: MethodChoice,
 
     // --------------------------------------------------------- probing ----
-    /// TCP ports to try, comma-separated. Defaults to 80,443,22,445,3389,8080.
-    #[arg(short = 'p', long, value_name = "PORTS", value_delimiter = ',')]
+    /// TCP ports to try, comma-separated. Bare `-p` means 80,443,3389,22.
+    ///
+    /// There are three cases, and the difference between the last two is the
+    /// point. `-p 80,443` and `-p` probe every host that is up, on 80,443, and on
+    /// 80,443,3389,22 respectively. Omitting the switch entirely uses the
+    /// cascade's list of 80,443,22,445,3389,8080, and uses it as a fallback:
+    /// only against addresses nothing else answered for.
+    ///
+    /// Naming ports asks a question about those ports rather than about who is
+    /// present, so it also changes what the TCP phase covers. With no value
+    /// given the cascade's own list is used, and it stays a fallback: a host
+    /// that already answered is not worth spending connects on. The banner says
+    /// which of the two is in effect.
+    #[arg(
+        short = 'p',
+        long,
+        value_name = "PORTS",
+        value_delimiter = ',',
+        num_args = 0..=1,
+        default_missing_value = "80,443,3389,22",
+        value_parser = parse_port,
+    )]
     pub ports: Option<Vec<u16>>,
 
     /// Milliseconds to wait for any single probe.
@@ -298,6 +319,22 @@ pub fn format_interfaces(ifaces: &[Interface]) -> String {
     out
 }
 
+/// Parse one port, and say something useful when the value is plainly not one.
+///
+/// `-p` takes an optional value, so the token after it is a port list if it can
+/// be one and a target if it cannot. The default error for `ipscan -p
+/// 192.168.1.0/24` is a bare "invalid digit found in string", which is true and
+/// useless; this names both ways out.
+fn parse_port(s: &str) -> Result<u16, String> {
+    s.parse::<u16>().map_err(|_| {
+        format!(
+            "{s:?} is not a port number (ports are 0-65535). If you meant it as \
+             the target, put the target first: `ipscan {s} -p`, or give the ports \
+             explicitly: `ipscan -p 80,443 {s}`"
+        )
+    })
+}
+
 /// Convenience for tests and callers that only have addresses.
 pub fn single_target(ip: Ipv4Addr) -> TargetSet {
     TargetSet::from_network(ip, 32).expect("a /32 is always valid")
@@ -350,6 +387,36 @@ mod tests {
             None,
             "unset ports must fall back to the default list"
         );
+    }
+
+    #[test]
+    fn a_bare_p_means_the_four_common_services() {
+        // `-p` with nothing after it is a request for the ports people usually
+        // mean, and a value is not required to ask for them.
+        assert_eq!(parse(&["-p"]).ports, Some(vec![80, 443, 3389, 22]));
+        assert_eq!(
+            parse(&["--ports"]).ports,
+            Some(vec![80, 443, 3389, 22]),
+            "the long form too"
+        );
+        // Naming ports at all is what switches the TCP phase from "residue only"
+        // to "every live host", so a bare -p has to register as explicit.
+        let plan = parse(&["-p"]).to_plan(single_target("10.0.0.1".parse().unwrap()), None);
+        assert!(plan.ports_explicit, "a bare -p still names ports");
+        assert_eq!(plan.config.ports, vec![80, 443, 3389, 22]);
+    }
+
+    #[test]
+    fn a_value_after_p_is_still_taken_as_the_port_list() {
+        // The trap with an optional value: `-p 80,443 10.0.0.0/24` must not read
+        // the target as a second value, and a bare target after -p must still be
+        // the target rather than a port.
+        let c = parse(&["-p", "80,443", "10.0.0.0/24"]);
+        assert_eq!(c.ports, Some(vec![80, 443]));
+        assert_eq!(c.targets, vec!["10.0.0.0/24".to_string()]);
+        let c = parse(&["-p", "22", "10.0.0.0/24"]);
+        assert_eq!(c.ports, Some(vec![22]));
+        assert_eq!(c.targets, vec!["10.0.0.0/24".to_string()]);
     }
 
     #[test]
