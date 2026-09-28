@@ -23,6 +23,12 @@
 //! because answering an ICMP echo requires an ARP resolution — which is what
 //! populates the table. That makes the post-sweep read a side effect of our own
 //! probe rather than a guess, and it needs no privileges.
+//!
+//! That second read also decides what a cache entry is worth. A resolved address
+//! is a completed ARP exchange, so it names a device — but it may predate the
+//! scan, and where no probe can be trusted it is the only evidence there is. So
+//! it can stand in for a reply, and it is counted separately whenever it does, so
+//! that a count mixing the two is never read as though every row had answered.
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -108,11 +114,7 @@ pub struct ScanPlan {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanStats {
     pub addresses: usize,
-    pub icmp_probes: u64,
-    pub tcp_connections: u64,
     pub arp_requests: u64,
-    /// Addresses handed to the TCP fallback because ICMP never answered.
-    pub escalated_to_tcp: usize,
     /// Addresses skipped by ARP because they are not on a directly-attached link.
     pub arp_unreachable: usize,
     /// Answers withheld from the default listing because nothing attributed them
@@ -248,8 +250,7 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
                     let before = settled.len();
                     let ticker = Ticker::start("icmp");
                     let phase_started = Instant::now();
-                    stats.icmp_probes +=
-                        run_icmp_rounds(&mut prober, &pending, plan, &mut table, &mut settled);
+                    run_icmp_rounds(&mut prober, &pending, plan, &mut table, &mut settled);
                     ticker.stop();
                     if plan.progress {
                         eprintln!(
@@ -284,7 +285,6 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
         let live: HashSet<Ipv4Addr> = table.alive().iter().map(|h| h.ip).collect();
         let (targets_for_tcp, known_live) = tcp_targets(plan.ports_explicit, &all, &settled, &live);
         if !targets_for_tcp.is_empty() {
-            stats.escalated_to_tcp = targets_for_tcp.len();
             if plan.progress {
                 if known_live > 0 {
                     eprintln!(
@@ -306,7 +306,6 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
             let ticker = Ticker::start("tcp");
             let phase_started = Instant::now();
             let mut prober = TcpProber::new(&plan.config);
-            stats.tcp_connections += attempts as u64;
             for reply in prober.probe_round(&targets_for_tcp)? {
                 record(&mut table, &mut settled, reply, Method::Tcp);
             }
@@ -507,22 +506,10 @@ pub fn run(plan: &ScanPlan) -> Result<ScanReport> {
     if plan.progress {
         // Say what was withheld, so the shorter list is never mistaken for the
         // whole sweep.
-        match stats.unverified_omitted {
-            0 => eprintln!(
-                "done: {} host{} in {}",
-                hosts.len(),
-                if hosts.len() == 1 { "" } else { "s" },
-                human(started.elapsed())
-            ),
-            n => eprintln!(
-                "done: {} host{} in {} ({} unattributed answer{} withheld)",
-                hosts.len(),
-                if hosts.len() == 1 { "" } else { "s" },
-                human(started.elapsed()),
-                n,
-                if n == 1 { "" } else { "s" }
-            ),
-        }
+        eprintln!(
+            "done: {}",
+            summary_line(&stats, hosts.len(), started.elapsed())
+        );
     }
 
     Ok(ScanReport {
@@ -997,6 +984,36 @@ fn resolve_all(ips: &[Ipv4Addr]) -> HashMap<Ipv4Addr, String> {
     found
 }
 
+/// "s" for anything that is not exactly one, so counts read as English.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// The closing progress line: how many hosts, how long, and any qualification
+/// the count carries.
+fn summary_line(stats: &ScanStats, hosts: usize, elapsed: Duration) -> String {
+    let mut caveats: Vec<String> = Vec::new();
+    let cache_only = stats.cache_only_hosts;
+    if cache_only > 0 {
+        caveats.push(format!(
+            "{cache_only} from the neighbour table alone, no probe reply"
+        ));
+    }
+    let withheld = stats.unverified_omitted;
+    if withheld > 0 {
+        caveats.push(format!(
+            "{withheld} unattributed answer{} withheld",
+            plural(withheld)
+        ));
+    }
+    let head = format!("{} host{} in {}", hosts, plural(hosts), human(elapsed));
+    if caveats.is_empty() {
+        head
+    } else {
+        format!("{head} ({})", caveats.join("; "))
+    }
+}
+
 /// Human-readable elapsed time: sub-second phases keep one decimal, longer ones
 /// do not, and anything past ten minutes reads as minutes rather than as a
 /// five-digit number of milliseconds.
@@ -1049,7 +1066,17 @@ impl Ticker {
         }
     }
 
+    /// Stop the heartbeat and wait for the thread to finish.
+    ///
+    /// Called explicitly at the end of a phase rather than left to `Drop`, so
+    /// the thread is joined *before* the phase's result line is printed. Relying
+    /// on the drop would let a tick land between the two.
     fn stop(mut self) {
+        self.halt();
+    }
+
+    /// Signal the thread and join it, at most once.
+    fn halt(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -1058,11 +1085,11 @@ impl Ticker {
 }
 
 impl Drop for Ticker {
+    /// Reached only if a phase panics. Without this the heartbeat thread would
+    /// outlive the scan and keep writing to stderr for as long as the process
+    /// lived.
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.halt();
     }
 }
 
@@ -1258,6 +1285,42 @@ mod tests {
             !out_of_scope,
             "an address on another interface must not be: {elsewhere}"
         );
+    }
+
+    #[test]
+    fn a_count_that_mixes_replies_with_cache_leftovers_says_so() {
+        // Cache-derived hosts are the weakest thing in the list, so a summary
+        // that counted them alongside probed hosts without saying so would read
+        // as though every row had answered. This had the field set and nothing
+        // reading it.
+        let mut stats = ScanStats {
+            cache_only_hosts: 24,
+            ..ScanStats::default()
+        };
+        let line = summary_line(&stats, 111, Duration::from_secs(2));
+        assert!(line.contains("24 from the neighbour table alone"), "{line}");
+        assert!(
+            line.contains("111 host"),
+            "the host count is still there: {line}"
+        );
+
+        // Both qualifications can apply at once and must both be reported.
+        stats.unverified_omitted = 5;
+        let line = summary_line(&stats, 100, Duration::from_secs(2));
+        assert!(line.contains("24 from the neighbour table"), "{line}");
+        assert!(line.contains("5 unattributed answers withheld"), "{line}");
+
+        // A clean scan gets the plain form.
+        let clean = ScanStats::default();
+        let line = summary_line(&clean, 20, Duration::from_secs(2));
+        assert!(!line.contains(';'), "nothing to qualify: {line}");
+    }
+
+    #[test]
+    fn plural_is_english_about_counts_and_nothing_else() {
+        assert_eq!(plural(0), "s");
+        assert_eq!(plural(1), "");
+        assert_eq!(plural(2), "s");
     }
 
     #[test]

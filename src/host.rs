@@ -47,8 +47,13 @@ impl fmt::Display for Method {
 pub enum Outcome {
     /// Direct proof of life: an echo reply, or a TCP connection that completed.
     Alive,
-    /// Indirect proof of life: the host reset our connection or answered with
-    /// ICMP destination-unreachable. It is up, but filtered our probe.
+    /// Indirect proof of life: the host reset our connection, or -- on the
+    /// raw-socket path, where the ICMP code can be trusted -- it answered with
+    /// protocol or port unreachable. It is up, but filtered our probe.
+    ///
+    /// Not used on Windows, where `IcmpSendEcho2` was measured returning
+    /// unreachable statuses for addresses that had nothing there at all, so an
+    /// error there is not evidence about the target.
     Filtered,
     /// No response either way. Carries no information about the host.
     Silent,
@@ -211,18 +216,14 @@ impl Host {
         }
     }
 
-    /// Fold a MAC in, if we learned one and did not have it before.
+    /// Record a hardware address for this host.
     ///
-    /// A changed MAC for the same IP means the address was reassigned (DHCP
-    /// turnover, a mobile device rejoining, etc.). The new value replaces the
-    /// old one because the change itself is a signal worth reporting.
+    /// A changed MAC for the same address means it was reassigned -- DHCP
+    /// turnover, a machine rejoining, a VM moved between hosts -- so the newer
+    /// value wins. This had carried an `if` block whose body was empty and whose
+    /// comment described a decision it did not make, which is worse than no
+    /// code at all: it read as if the reassignment were being handled.
     pub fn set_mac(&mut self, mac: MacAddr) {
-        if let Some(existing) = self.mac
-            && existing != mac
-        {
-            // MAC changed for this IP: record the new value. The change is a
-            // signal that the address was reassigned.
-        }
         self.mac = Some(mac);
     }
 }

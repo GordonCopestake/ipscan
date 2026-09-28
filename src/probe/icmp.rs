@@ -411,9 +411,18 @@ mod imp {
                 // unreachable can only be sent by the host itself, which had to
                 // exist to reject the datagram, so those prove life. Network and
                 // host unreachable are the network reporting that nothing is at
-                // the address, and treating them as proof of life is how a scan
-                // ends up reporting a subnet full of machines that `ping` calls
-                // unreachable.
+                // the address, and treating *those* as proof of life is how a
+                // scan ends up reporting machines that `ping` calls unreachable.
+                //
+                // This is deliberately different from the Windows path, which
+                // discards every unreachable status. There the distinction
+                // cannot be trusted: measured against `ping` on a real host,
+                // IcmpSendEcho2 returned IP_DEST_PROT_UNREACHABLE for addresses
+                // that answered ping and for addresses that were simply empty,
+                // and timed out for others, so the status carried no information
+                // about the target. Here the header is in hand and the code is
+                // exactly what it claims to be. A commit message once said this
+                // path discarded them too, which was never true.
                 _ => match wire::unreachable_code(&buf[icmp_at..n]) {
                     Some(c) if c == wire::ICMP_UNREACH_PROTOCOL || c == wire::ICMP_UNREACH_PORT => {
                         Reply {
@@ -670,12 +679,6 @@ mod imp {
     use windows::Win32::NetworkManagement::IpHelper::{
         ICMP_ECHO_REPLY, IP_OPTION_INFORMATION, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho2,
     };
-
-    /// The `IP_*` codes that mean the network answered with an error rather
-    /// than the target staying silent.
-    const IP_DEST_HOST_UNREACHABLE: u32 = 11004;
-    const IP_DEST_NET_UNREACHABLE: u32 = 11001;
-    const IP_DEST_PROT_UNREACHABLE: u32 = 11010;
 
     /// Windows has one viable ICMP path and no privilege ladder to climb.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
