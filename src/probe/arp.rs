@@ -18,7 +18,6 @@
 //! directly-connected target set are both available.
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 use anyhow::Result;
 
@@ -71,15 +70,7 @@ impl ArpProber {
     pub fn probe_round(&mut self, targets: &[Ipv4Addr]) -> Result<Vec<Reply>> {
         self.inner.probe_round(targets)
     }
-
-    pub fn timeout(&self) -> Duration {
-        self.inner.timeout()
-    }
 }
-
-/// Replies carry the MAC alongside the liveness verdict, because for ARP the
-/// hardware address is the payload rather than an afterthought.
-pub use crate::host::MacAddr as ArpMac;
 
 // ---------------------------------------------------------------- linux ----
 
@@ -94,7 +85,7 @@ mod platform {
 
     use super::{Availability, Reply};
     use crate::host::{MacAddr, Outcome};
-    use crate::probe::ProbeConfig;
+    use crate::probe::{ProbeConfig, Throttle};
 
     /// Offset of the fields we want inside `struct arphdr`.
     const ARPHDR_FIXED_LEN: usize = 8;
@@ -109,6 +100,7 @@ mod platform {
         our_mac: [u8; 6],
         our_ip: Ipv4Addr,
         timeout: Duration,
+        throttle: Throttle,
     }
 
     pub fn availability() -> Availability {
@@ -187,11 +179,8 @@ mod platform {
                 our_mac,
                 our_ip,
                 timeout: cfg.timeout,
+                throttle: Throttle::new(cfg.rate, cfg.timeout),
             })
-        }
-
-        pub fn timeout(&self) -> Duration {
-            self.timeout
         }
 
         pub fn probe_round(&mut self, targets: &[Ipv4Addr]) -> Result<Vec<Reply>> {
@@ -203,6 +192,11 @@ mod platform {
             let mut sent = 0usize;
             for &ip in targets {
                 let frame = self.build_request(ip, broadcast);
+                // An ARP sweep is the loudest thing this tool does: one broadcast
+                // per address, at line rate. `--rate` is the knob for a segment
+                // where that floods the reply path, so it is applied here rather
+                // than being accepted and ignored.
+                self.throttle.wait();
                 if self.send(&frame).is_ok() {
                     sent += 1;
                 }
@@ -410,19 +404,18 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::net::Ipv4Addr;
-    use std::time::Duration;
 
     use anyhow::Result;
     use windows::Win32::NetworkManagement::IpHelper::SendARP;
 
     use super::{Availability, Reply};
     use crate::host::Outcome;
-    use crate::probe::ProbeConfig;
+    use crate::probe::{ProbeConfig, Throttle};
 
     pub struct Inner {
-        timeout: Duration,
         source: Option<Ipv4Addr>,
         concurrency: usize,
+        throttle: Throttle,
     }
 
     /// `SendARP` lives in iphlpapi and works for ordinary users, so unlike the
@@ -434,14 +427,10 @@ mod platform {
     impl Inner {
         pub fn new(cfg: &ProbeConfig) -> Result<Self> {
             Ok(Inner {
-                timeout: cfg.timeout,
                 source: cfg.source,
                 concurrency: cfg.concurrency,
+                throttle: Throttle::new(cfg.rate, cfg.timeout),
             })
-        }
-
-        pub fn timeout(&self) -> Duration {
-            self.timeout
         }
 
         /// `SendARP` is synchronous and per-target: it blocks until that one
@@ -457,6 +446,11 @@ mod platform {
             }
             let chunk = targets.len().div_ceil(workers);
             let source = self.source;
+            // `SendARP` is paced per request inside each worker. The pacing is
+            // what `--rate` is for on this path: a burst of concurrent SendARP
+            // calls is exactly the load that makes a switch drop the replies.
+            // The gap is already clipped by the per-probe cap.
+            let gap = self.throttle.gap();
 
             let answered: Vec<Reply> = std::thread::scope(|scope| {
                 let handles: Vec<_> = targets
@@ -465,6 +459,9 @@ mod platform {
                         scope.spawn(move || {
                             let mut out = Vec::new();
                             for &ip in batch {
+                                if let Some(gap) = gap {
+                                    std::thread::sleep(gap);
+                                }
                                 if let Some(mac) = send_one(source, ip) {
                                     out.push(Reply::new(ip, Outcome::Alive).with_mac(mac));
                                 }
@@ -518,7 +515,6 @@ mod platform {
 #[cfg(not(any(target_os = "linux", windows)))]
 mod platform {
     use std::net::Ipv4Addr;
-    use std::time::Duration;
 
     use anyhow::{Result, bail};
 
@@ -539,10 +535,6 @@ mod platform {
             bail!(
                 "active ARP is not implemented on this platform; the passive neighbour table is used instead"
             )
-        }
-
-        pub fn timeout(&self) -> Duration {
-            Duration::from_millis(0)
         }
 
         pub fn probe_round(&mut self, _targets: &[Ipv4Addr]) -> Result<Vec<Reply>> {

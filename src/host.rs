@@ -141,11 +141,8 @@ impl MacAddr {
         Some(MacAddr(out))
     }
 
-    /// The 24-bit OUI prefix, used to look up the hardware vendor.
-    pub fn oui(&self) -> [u8; 3] {
-        [self.0[0], self.0[1], self.0[2]]
-    }
-
+    /// Whether this address is the broadcast address, which is a group address
+    /// and never a host.
     pub fn is_broadcast(&self) -> bool {
         self.0 == [0xff; 6]
     }

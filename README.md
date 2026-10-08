@@ -14,7 +14,7 @@ IP             MAC                PORT      RTT  TTL  METHOD
 192.168.0.79  -                      -    0.81 ms  64   icmp
 192.168.0.90  1a:28:61:34:77:4a   8080   92.04 ms  64   icmp
 
-3 hosts found out of 256 addresses scanned in 2.98s via wlp0s20f3
+3 hosts found out of 254 addresses scanned in 2.98s via wlp0s20f3
 ```
 
 ## A timeout does not mean a machine is dead
@@ -101,7 +101,7 @@ cargo install --path .
 To check the build before trusting it:
 
 ```
-cargo test          # 81 unit tests
+cargo test          # 129 unit tests
 cargo clippy --all-targets
 ```
 
@@ -133,12 +133,12 @@ ipscan 0.5.1
   interface   eth0 (192.168.0.79/24)
   addresses   256
   method      auto (arp, then icmp, then tcp)
-  timeout     1000ms, 1 retry
-  ports       80, 443, 22, 445, 3389, 8080
+  timeout     500ms, 1 retry
+  ports (fallback)       80, 443, 22, 445, 3389, 8080
 
 reading the neighbour cache...
   neighbour cache: 25 entries in 0.0s
-probing 256 on-link addresses with arp...
+probing 254 on-link addresses with arp...
   arp: waiting, 2s elapsed
   arp: 4 alive of 256 in 6.1s
 probing 252 addresses with icmp...
@@ -200,10 +200,11 @@ Other useful flags:
 ```
 ipscan -L                       # list interfaces and their subnets
 ipscan --dns                    # reverse-resolve (slower)
-ipscan --cached                 # also show addresses only the OS cache knows
-ipscan --strict                 # list only hosts with a known hardware address
 ipscan --cached                 # also list addresses only the neighbour table names
-ipscan --sort rtt               # order by latency, ip, or hostname
+ipscan --strict                 # list only hosts with a known hardware address
+ipscan --include-unverified     # list every address that answered, over --strict
+ipscan --rate 200               # cap the sweep at 200 probes per second
+ipscan --sort rtt               # order by latency, ip, hostname, or mac
 ipscan -q                       # no summary line
 ipscan -v                       # per-stage progress and notes
 ```
@@ -273,10 +274,14 @@ column and their RTTs span a suspiciously narrow range is that, and `ipscan`
 says so:
 
 ```
-warning: 136 of the 254 live hosts cannot be attributed to a device: arp did not
-name them ... Their round-trip times span 758ms to 1002ms, which is the signature
-of a single periodic responder rather than 136 separate machines. Only the 118
-hosts arp named should be counted as a host census; treat the rest as unverified.
+warning: 136 of the 254 live hosts cannot be attributed to a device: no hardware
+address is known for them, so nothing here can say which device they are. On a
+directly-attached link that combination is contradictory, because answering icmp
+requires having resolved the target's hardware address first. Something is
+answering echo on behalf of 136 addresses it does not own, or the sweep lost 136
+replies. Their round-trip times span 758.0ms to 1002.0ms, which is what one
+device replying on a schedule looks like. Only the 118 hosts that were attributed
+should be counted as a host census; treat the rest as unverified.
 ```
 
 The warning is deliberately quiet about a handful of unnamed hosts. A busy
@@ -403,6 +408,28 @@ timeout, this can cut the ARP phase from ~13 s to ~1 s on a /24.
 The default probe timeout is now 500 ms (was 1000 ms). With the default one
 retry this halves the worst-case time for non-responders from 2 s to 1 s.
 Restore the old behaviour with `--timeout 1000`.
+
+### `--rate` now actually caps the sweep
+
+`--rate` was accepted and quietly ignored: it reached `ProbeConfig` and nothing
+read it, so a scan ran at full speed no matter what you asked for. It is now a
+real limiter on all three probes.
+
+The point of pacing is that the fastest sweep is not the one that finds the most
+hosts. An ARP sweep is one broadcast per address at line rate, and on a segment
+with a switch or a host with a small receive queue that saturates the reply path
+— the requests that get through are the ones whose answers get dropped. Pacing
+trades wall-clock time for recall.
+
+```
+ipscan 192.168.1.0/24 --rate 200     # at most 200 probes per second
+```
+
+Two rules keep pacing from becoming its own failure mode. The wait is capped at
+half the probe timeout, so `--rate 1` cannot make every probe time out for a
+reason that has nothing to do with the target. And a round's deadline is extended
+by whatever the pacing cost, so `--rate` changes how fast probes leave, not how
+long each one is allowed to wait for an answer.
 
 ### `-p` is a question about ports, not a fallback
 

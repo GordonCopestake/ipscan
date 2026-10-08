@@ -28,7 +28,7 @@ use polling::{Event, Events, Poller};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::host::Outcome;
-use crate::probe::{ProbeConfig, Reply};
+use crate::probe::{ProbeConfig, Reply, Throttle};
 
 /// Ports tried by default, chosen for being common on consumer and office
 /// hardware rather than for any particular platform.
@@ -41,6 +41,8 @@ pub struct TcpProber {
     /// Source address to originate connections from, so traffic leaves via the
     /// interface the user selected.
     source: Option<Ipv4Addr>,
+    /// Pacing for `--rate`, applied to the starts of connects.
+    throttle: Throttle,
     /// Connections that could not even be attempted, kept for `--verbose`.
     failures: Vec<String>,
 }
@@ -52,6 +54,7 @@ impl TcpProber {
             timeout: cfg.timeout,
             concurrency: cfg.concurrency.max(1),
             source: cfg.source,
+            throttle: Throttle::new(cfg.rate, cfg.timeout),
             failures: Vec::new(),
         }
     }
@@ -67,12 +70,11 @@ impl TcpProber {
         &self.ports
     }
 
-    /// Probe every target on every configured port concurrently, reporting the
-    /// first conclusive answer per target.
+    /// Probe every target on every configured port concurrently.
     ///
-    /// Ports are tried in the order given, so the reported open port is the
-    /// lowest-numbered one that answered. Once a target is settled its other
-    /// sockets are closed immediately rather than run to completion.
+    /// Every port of every target is attempted, so the port column is an
+    /// inventory rather than a sample: a host with 80, 443 and 22 open is
+    /// reported with all three, not with whichever answered first.
     pub fn probe_round(&mut self, targets: &[Ipv4Addr]) -> Result<Vec<Reply>> {
         if targets.is_empty() || self.ports.is_empty() {
             return Ok(Vec::new());
@@ -80,7 +82,6 @@ impl TcpProber {
 
         let poller = Poller::new()?;
         let deadline = Instant::now() + self.timeout;
-
         // Work list, port-interleaved so one slow target cannot starve the batch.
         let mut queue: Vec<(Ipv4Addr, u16)> = Vec::with_capacity(targets.len() * self.ports.len());
         for &ip in targets {
@@ -97,6 +98,7 @@ impl TcpProber {
         let mut replies: Vec<Reply> = Vec::new();
         let mut next_job = 0usize;
         let mut events = Events::new();
+        let mut paced_for = Duration::ZERO;
 
         loop {
             // Fill up to the concurrency ceiling.
@@ -111,6 +113,11 @@ impl TcpProber {
             while inflight.len() < self.concurrency && next_job < queue.len() {
                 let (ip, port) = queue[next_job];
                 next_job += 1;
+                // Pacing is applied per connect start. The deadline is pushed out
+                // by whatever the pacing cost, so a paced round is not also a
+                // shortened one: `--rate` changes how fast probes leave, not how
+                // long each one is allowed to wait for an answer.
+                paced_for += self.throttle.wait();
                 match start_connect(ip, port, self.source) {
                     Start::Connected => {
                         replies.push(Reply::new(ip, Outcome::Alive).with_port(port));
@@ -144,7 +151,10 @@ impl TcpProber {
                 break;
             }
 
-            if poller.wait_deadline(&mut events, deadline).is_err() {
+            if poller
+                .wait_deadline(&mut events, deadline + paced_for)
+                .is_err()
+            {
                 break;
             }
             // The round deadline expired with nothing left to collect. Without

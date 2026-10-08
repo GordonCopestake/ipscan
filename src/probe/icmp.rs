@@ -134,7 +134,7 @@ mod imp {
 
     use super::wire;
     use crate::host::Outcome;
-    use crate::probe::{ProbeConfig, Reply};
+    use crate::probe::{ProbeConfig, Reply, Throttle};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum SocketKind {
@@ -169,6 +169,7 @@ mod imp {
         inflight: HashMap<u16, Pending>,
         next_seq: u16,
         timeout: Duration,
+        throttle: Throttle,
     }
 
     impl Inner {
@@ -227,6 +228,7 @@ mod imp {
                 inflight: HashMap::new(),
                 next_seq: (std::process::id() as u16) ^ 0x5a5a,
                 timeout: cfg.timeout,
+                throttle: Throttle::new(cfg.rate, cfg.timeout),
             })
         }
 
@@ -245,9 +247,16 @@ mod imp {
         ) -> Result<Vec<Reply>> {
             self.inflight.clear();
 
+            // Pacing is applied to the sends, which is the only place it can be:
+            // every request in a round shares one socket and one deadline, so
+            // spacing the *replies* would change nothing about the load on the
+            // wire. The deadline is measured from the first send, so a paced
+            // round gets its full window back at the end.
+            let mut paced_for = Duration::ZERO;
             for ip in targets {
                 let seq = self.alloc_seq();
                 let pkt = wire::echo_request(seq, self.identifier);
+                paced_for += self.throttle.wait();
                 if self.send(*ip, &pkt).is_ok() {
                     self.inflight.insert(
                         seq,
@@ -263,7 +272,7 @@ mod imp {
                 return Ok(Vec::new());
             }
 
-            let deadline = Instant::now() + timeout;
+            let deadline = Instant::now() + timeout + paced_for;
             let mut replies = Vec::with_capacity(self.inflight.len());
 
             while !self.inflight.is_empty() {
@@ -674,7 +683,7 @@ mod imp {
     use super::windows_verdict;
     use super::wire;
     use crate::host::Outcome;
-    use crate::probe::{ProbeConfig, Reply};
+    use crate::probe::{ProbeConfig, Reply, Throttle};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::NetworkManagement::IpHelper::{
         ICMP_ECHO_REPLY, IP_OPTION_INFORMATION, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho2,
@@ -709,6 +718,7 @@ mod imp {
         handle: SharedHandle,
         timeout_ms: u32,
         concurrency: usize,
+        throttle: Throttle,
     }
 
     // The handle is owned by `Inner` and closed in `Drop`; these calls are
@@ -721,6 +731,7 @@ mod imp {
                 handle: SharedHandle(handle),
                 timeout_ms: cfg.timeout.as_millis().min(u32::MAX as u128) as u32,
                 concurrency: cfg.concurrency.max(1),
+                throttle: Throttle::new(cfg.rate, cfg.timeout),
             })
         }
 
@@ -753,6 +764,11 @@ mod imp {
             let chunk = targets.len().div_ceil(workers);
             let handle = self.handle;
             let timeout_ms = self.timeout_ms;
+            // `IcmpSendEcho2` is synchronous per target and cannot be paced from
+            // one shared schedule without serialising the pool, so each worker
+            // sleeps the throttle's gap before the target it dials. The gap is
+            // already clipped by the per-probe cap.
+            let gap = self.throttle.gap();
 
             let replies: Vec<Reply> = std::thread::scope(|scope| {
                 let handles: Vec<_> = targets
@@ -773,6 +789,11 @@ mod imp {
                             let mut reply_buf = [0u8; 1024];
                             let mut out = out;
                             for &ip in batch {
+                                if let Some(gap) = gap {
+                                    // Pace per target rather than per chunk, so a
+                                    // wide chunk does not arrive as a burst.
+                                    std::thread::sleep(gap);
+                                }
                                 if let Some(r) =
                                     send_one(&handle, ip, timeout_ms, &opts, &mut reply_buf)
                                 {

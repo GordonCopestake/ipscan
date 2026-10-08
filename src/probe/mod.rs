@@ -10,7 +10,7 @@ pub mod neighbour;
 pub mod tcp;
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::host::{Evidence, Method, Outcome};
 
@@ -66,6 +66,78 @@ pub fn blocking_workers(total: usize, concurrency: usize) -> usize {
         return 0;
     }
     concurrency.clamp(1, MAX_BLOCKING_WORKERS).min(total)
+}
+
+/// A pacing gate for probes that would otherwise fire as fast as the loop can
+/// turn.
+///
+/// `--rate` exists because a sweep that floods a segment loses its own replies:
+/// a switch or a host with a small receive queue drops the responses we most
+/// want, so the fastest sweep is not the one that finds the most hosts. It is
+/// also the knob for a network where the scanner is the loudest thing on the
+/// wire.
+///
+/// The limiter is deliberately coarse. It spaces *starts*, not packets, and it
+/// never holds a probe past the point where waiting would eat the timeout it is
+/// about to be measured against: a probe that starts late has already lost part
+/// of its window. So the wait is capped at half the probe timeout, and a rate
+/// too slow to fit a whole round inside the deadline is reported rather than
+/// silently obeyed.
+#[derive(Debug, Clone)]
+pub struct Throttle {
+    /// Time between probe starts. `None` means no pacing.
+    gap: Option<Duration>,
+    /// Longest wait we are willing to impose on a single probe.
+    cap: Duration,
+    next: Instant,
+}
+
+impl Throttle {
+    /// Build a throttle from a probes-per-second ceiling, if one was asked for.
+    pub fn new(rate_pps: Option<u32>, timeout: Duration) -> Self {
+        let gap = rate_pps
+            .filter(|r| *r > 0)
+            .map(|r| Duration::from_secs_f64(1.0 / f64::from(r)));
+        Throttle {
+            gap,
+            cap: timeout / 2,
+            next: Instant::now(),
+        }
+    }
+
+    pub fn paced(&self) -> bool {
+        self.gap.is_some()
+    }
+
+    /// The gap between starts, already clipped by the per-probe cap.
+    ///
+    /// A backend that cannot hold a throttle across its worker threads paces by
+    /// sleeping this long per probe instead.
+    pub fn gap(&self) -> Option<Duration> {
+        self.gap.map(|g| g.min(self.cap))
+    }
+
+    /// Block until this probe may start, and advance the schedule.
+    ///
+    /// Returns how long the caller had to wait, so a phase can push its deadline
+    /// out by the same amount: pacing must not also shorten the window each probe
+    /// is allowed for an answer.
+    pub fn wait(&mut self) -> Duration {
+        let Some(gap) = self.gap else {
+            return Duration::ZERO;
+        };
+        let now = Instant::now();
+        if now >= self.next {
+            // Behind schedule: start now rather than banking unused credit, which
+            // would let a slow phase burst afterwards.
+            self.next = now + gap;
+            return Duration::ZERO;
+        }
+        let wait = (self.next - now).min(self.cap);
+        std::thread::sleep(wait);
+        self.next += gap;
+        wait
+    }
 }
 
 /// The result of probing a single target.
@@ -134,12 +206,6 @@ impl Reply {
     }
 }
 
-/// Check the one address that is definitionally alive, so scans have a sanity
-/// anchor and the output always contains something on a working machine.
-pub fn self_check(addr: Ipv4Addr) -> bool {
-    addr.is_loopback() || addr.is_unspecified()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +264,84 @@ mod tests {
     fn blocking_probes_survive_nonsense_concurrency() {
         assert_eq!(blocking_workers(256, 0), 1, "a zero is raised to one");
         assert_eq!(blocking_workers(0, 256), 0, "no targets, no workers");
+    }
+
+    #[test]
+    fn no_rate_means_no_pacing() {
+        // The common case must cost nothing: an unpaced throttle never sleeps
+        // and never reports a gap.
+        let mut t = Throttle::new(None, Duration::from_millis(500));
+        assert!(!t.paced());
+        assert!(t.gap().is_none());
+        let started = Instant::now();
+        for _ in 0..50 {
+            assert_eq!(t.wait(), Duration::ZERO);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_zero_rate_is_not_a_rate() {
+        // `--rate 0` would mean "wait forever between probes", which is not a
+        // thing anyone means when they type it.
+        let t = Throttle::new(Some(0), Duration::from_millis(500));
+        assert!(!t.paced(), "a zero must fall back to unpaced");
+    }
+
+    #[test]
+    fn pacing_spaces_the_starts() {
+        // 2000 pps is a 0.5ms gap. Ten starts must therefore take several
+        // milliseconds, not zero, and the measured rate must be near the
+        // requested one.
+        let mut t = Throttle::new(Some(2000), Duration::from_millis(500));
+        assert!(t.paced());
+        let started = Instant::now();
+        for _ in 0..10 {
+            t.wait();
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(4),
+            "10 starts at 2000pps should take ~4.5ms, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn pacing_never_eats_the_timeout_it_is_measured_against() {
+        // An absurd rate must not turn into a wait longer than the probe's own
+        // deadline, or `--rate 1` would make every probe time out for a reason
+        // that has nothing to do with the target. The cap is half the timeout,
+        // so a 1s gap against a 400ms probe is clipped to 200ms.
+        let t = Throttle::new(Some(1), Duration::from_millis(400));
+        assert_eq!(
+            t.gap(),
+            Some(Duration::from_millis(200)),
+            "a 1s gap must be clipped to half the probe timeout"
+        );
+        let started = Instant::now();
+        let mut t = t;
+        t.wait();
+        assert!(
+            started.elapsed() <= Duration::from_millis(250),
+            "a wait must be capped at half the probe timeout, got {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_unpaced_throttle_does_not_accumulate_credit() {
+        // A throttle that has been idle must not burst afterwards: waiting is
+        // scheduled from "now" whenever the schedule is already in the past.
+        let mut t = Throttle::new(Some(1000), Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            t.wait(),
+            Duration::ZERO,
+            "behind schedule means start immediately"
+        );
     }
 }
